@@ -1,0 +1,92 @@
+{
+  "enabled": {
+    "description": "是否启用 B 站弹幕监听任务",
+    "type": "bool",
+    "default": true
+  },
+  "room_id": {
+    "description": "B 站直播间号（短号或房间号均可）",
+    "type": "int",
+    "default": 0
+  },
+  "window_seconds": {
+    "description": "弹幕统计时间窗口（秒，优先级高于 window_minutes）",
+    "type": "int",
+    "default": 60
+  },
+  "window_minutes": {
+    "description": "弹幕统计时间窗口（分钟，仅当 window_seconds<=0 时生效）",
+    "type": "int",
+    "default": 1
+  },
+  "poll_interval_seconds": {
+    "description": "轮询 B 站历史弹幕的间隔（秒）",
+    "type": "int",
+    "default": 15
+  },
+  "trigger_threshold": {
+    "description": "窗口内弹幕数达到该阈值后触发模型",
+    "type": "int",
+    "default": 20
+  },
+  "trigger_cooldown_seconds": {
+    "description": "触发后冷却时间（秒）",
+    "type": "int",
+    "default": 60
+  },
+  "target_umo": {
+    "description": "直接指定消息目标 UMO（例如 aiocqhttp:GroupMessage:123456789）",
+    "type": "string",
+    "default": ""
+  },
+  "target_platform_id": {
+    "description": "目标平台适配器 ID（当 target_umo 为空时使用）",
+    "type": "string",
+    "default": "default"
+  },
+  "target_type": {
+    "description": "目标会话类型（group/private）",
+    "type": "string",
+    "default": "group"
+  },
+  "target_id": {
+    "description": "目标群号或私聊号（当 target_umo 为空时使用）",
+    "type": "string",
+    "default": ""
+  },
+  "max_context_danmaku": {
+    "description": "注入模型的最大弹幕条数",
+    "type": "int",
+    "default": 40
+  },
+  "max_history_messages": {
+    "description": "注入模型的历史会话条数",
+    "type": "int",
+    "default": 12
+  },
+  "max_reply_chars": {
+    "description": "模型生成内容最大字符数",
+    "type": "int",
+    "default": 60
+  },
+  "inject_bili_send_hint": {
+    "description": "是否在提示词注入“可同步发送到直播间”的要求",
+    "type": "bool",
+    "default": true
+  },
+  "bilibili_cookie": {
+    "description": "B 站 Cookie 字符串（可留空并从文件加载）",
+    "type": "string",
+    "default": ""
+  },
+  "auto_load_cookie_from_file": {
+    "description": "当 bilibili_cookie 为空时，是否自动读取 cookie 文件",
+    "type": "bool",
+    "default": true
+  },
+  "bilibili_cookie_file": {
+    "description": "Cookie 文件路径（兼容 bilibili-danmu_sender 的 JSON 格式）",
+    "type": "string",
+    "default": "~/.bilibili-cookie.json"
+  }
+}
