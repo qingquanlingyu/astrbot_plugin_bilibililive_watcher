@@ -201,7 +201,17 @@ cython_debug/
 .cursorignore
 .cursorindexingignore
 
+
 # Marimo
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+__pycache__/
+.tmp_rknn_target/
+.wheelhouse_rknn/
+tdd-summary/
+tests/
+docs/
+models/
+completed-tdd-archives/

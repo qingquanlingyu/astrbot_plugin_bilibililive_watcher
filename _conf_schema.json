@@ -4,35 +4,40 @@
     "type": "bool",
     "default": true
   },
+  "debug": {
+    "description": "调试开关：开启后打印弹幕、ASR 结果和最终 prompt",
+    "type": "bool",
+    "default": false
+  },
   "room_id": {
     "description": "B 站直播间号（短号或房间号均可）",
     "type": "int",
     "default": 0
   },
-  "window_seconds": {
-    "description": "弹幕统计时间窗口（秒，优先级高于 window_minutes）",
-    "type": "int",
-    "default": 60
+  "pipeline_mode": {
+    "description": "管线模式：danmu_only / danmu_plus_asr / asr_only",
+    "type": "string",
+    "default": "danmu_plus_asr"
   },
-  "window_minutes": {
-    "description": "弹幕统计时间窗口（分钟，仅当 window_seconds<=0 时生效）",
-    "type": "int",
-    "default": 1
-  },
-  "poll_interval_seconds": {
-    "description": "轮询 B 站历史弹幕的间隔（秒）",
+  "reply_interval_seconds": {
+    "description": "统一循环时间（秒）：同时用于主循环检查与 history 轮询",
     "type": "int",
     "default": 15
   },
-  "trigger_threshold": {
-    "description": "窗口内弹幕数达到该阈值后触发模型",
+  "context_window_seconds": {
+    "description": "上下文保留窗口（秒）：控制参与融合与 prompt 的最近弹幕/ASR 历史范围",
+    "type": "int",
+    "default": 45
+  },
+  "danmaku_trigger_threshold": {
+    "description": "累计弹幕条数达到该阈值后，才允许触发回复",
     "type": "int",
     "default": 20
   },
-  "trigger_cooldown_seconds": {
-    "description": "触发后冷却时间（秒）",
+  "asr_trigger_threshold": {
+    "description": "累计 ASR 语句条数达到该阈值后，才允许触发回复（danmu_plus_asr / asr_only 模式）",
     "type": "int",
-    "default": 60
+    "default": 1
   },
   "target_umo": {
     "description": "直接指定消息目标 UMO（例如 aiocqhttp:GroupMessage:123456789）",
@@ -54,39 +59,159 @@
     "type": "string",
     "default": ""
   },
-  "max_context_danmaku": {
-    "description": "注入模型的最大弹幕条数",
-    "type": "int",
-    "default": 40
-  },
-  "max_history_messages": {
-    "description": "注入模型的历史会话条数",
-    "type": "int",
-    "default": 12
-  },
   "max_reply_chars": {
     "description": "模型生成内容最大字符数",
     "type": "int",
-    "default": 60
+    "default": 30
   },
-  "inject_bili_send_hint": {
-    "description": "是否在提示词注入“可同步发送到直播间”的要求",
-    "type": "bool",
-    "default": true
-  },
-  "bilibili_cookie": {
-    "description": "B 站 Cookie 字符串（可留空并从文件加载）",
+  "bili_cookie": {
+    "description": "B 站 Cookie 字符串（推荐字段名；兼容 bilibili_cookie）",
     "type": "string",
     "default": ""
   },
+  "bili_cookie_file": {
+    "description": "Cookie 文件路径（推荐字段名；兼容 bilibili_cookie_file）",
+    "type": "string",
+    "default": "~/.bilibili-cookie.json"
+  },
   "auto_load_cookie_from_file": {
-    "description": "当 bilibili_cookie 为空时，是否自动读取 cookie 文件",
+    "description": "当 cookie 为空时是否自动读取 cookie 文件",
     "type": "bool",
     "default": true
   },
-  "bilibili_cookie_file": {
-    "description": "Cookie 文件路径（兼容 bilibili-danmu_sender 的 JSON 格式）",
+  "use_realtime_danmaku_ws": {
+    "description": "是否优先使用实时弹幕 WebSocket",
+    "type": "bool",
+    "default": true
+  },
+  "danmu_ws_auth_mode": {
+    "description": "实时弹幕鉴权模式：history_only / signed_wbi",
     "type": "string",
-    "default": "~/.bilibili-cookie.json"
+    "default": "signed_wbi"
+  },
+  "allow_buvid3_only": {
+    "description": "实时弹幕鉴权时是否优先只带 buvid3",
+    "type": "bool",
+    "default": true
+  },
+  "wbi_sign_enabled": {
+    "description": "是否对 getDanmuInfo 启用 WBI 签名",
+    "type": "bool",
+    "default": true
+  },
+  "audio_enabled": {
+    "description": "在 danmu_plus_asr / asr_only 模式下是否启用音频拉流",
+    "type": "bool",
+    "default": true
+  },
+  "audio_pull_protocol": {
+    "description": "音频拉流协议：http_flv / hls",
+    "type": "string",
+    "default": "http_flv"
+  },
+  "audio_pull_api_preference": {
+    "description": "音频拉流 API 优先级：getRoomPlayInfo / playUrl",
+    "type": "string",
+    "default": "getRoomPlayInfo"
+  },
+  "audio_http_headers_enabled": {
+    "description": "ffmpeg 拉流时是否注入 Referer/Origin/User-Agent/Cookie",
+    "type": "bool",
+    "default": true
+  },
+  "ffmpeg_path": {
+    "description": "ffmpeg 可执行文件路径",
+    "type": "string",
+    "default": "ffmpeg"
+  },
+  "audio_sample_rate": {
+    "description": "ASR 音频采样率",
+    "type": "int",
+    "default": 16000
+  },
+  "asr_backend": {
+    "description": "ASR 后端：保留 sherpa_onnx_rknn / sherpa_onnx_cpu_onnx 兼容字段",
+    "type": "string",
+    "default": "sherpa_onnx_rknn"
+  },
+  "asr_strategy": {
+    "description": "ASR 策略：sensevoice_vad_offline / streaming_zipformer",
+    "type": "string",
+    "default": "sensevoice_vad_offline"
+  },
+  "asr_model_dir": {
+    "description": "sherpa ASR 模型目录；SenseVoice 默认应指向官方 sherpa-onnx RKNN release 目录",
+    "type": "string",
+    "default": "./models/sherpa/rknn/sherpa-onnx-rk3588-20-seconds-sense-voice-zh-en-ja-ko-yue-2024-07-17"
+  },
+  "asr_vad_model_path": {
+    "description": "Silero VAD ONNX 模型文件路径（相对插件目录解析）",
+    "type": "string",
+    "default": "./models/vad/silero_vad.onnx"
+  },
+  "asr_vad_threshold": {
+    "description": "Silero VAD 触发阈值",
+    "type": "float",
+    "default": 0.3
+  },
+  "asr_vad_min_silence_duration": {
+    "description": "VAD 判定句段结束所需最小静音时长（秒）",
+    "type": "float",
+    "default": 0.35
+  },
+  "asr_vad_min_speech_duration": {
+    "description": "VAD 判定有效语音所需最小时长（秒）",
+    "type": "float",
+    "default": 0.25
+  },
+  "asr_vad_max_speech_duration": {
+    "description": "VAD 单句最长时长（秒）；默认与 20-second SenseVoice 模型对齐",
+    "type": "float",
+    "default": 20.0
+  },
+  "asr_sense_voice_language": {
+    "description": "SenseVoice 语言参数：auto / zh / en / ja / ko / yue",
+    "type": "string",
+    "default": "auto"
+  },
+  "asr_sense_voice_use_itn": {
+    "description": "SenseVoice 是否启用 ITN",
+    "type": "bool",
+    "default": true
+  },
+  "asr_runtime_probe_required": {
+    "description": "是否要求先通过运行时探测再启用 ASR",
+    "type": "bool",
+    "default": true
+  },
+  "asr_threads": {
+    "description": "ASR 线程 / RKNN NPU core mask（RKNN 推荐 1；兼容 0/-1/-2/-3/-4）",
+    "type": "int",
+    "default": 1
+  },
+  "asr_vad_enabled": {
+    "description": "旧版兼容字段；streaming_zipformer 时仍透传，sensevoice_vad_offline 下实际固定使用 VAD",
+    "type": "bool",
+    "default": false
+  },
+  "asr_sentence_pause_seconds": {
+    "description": "旧 streaming_zipformer 断句参数：按停顿断句时的最小停顿秒数",
+    "type": "float",
+    "default": 0.75
+  },
+  "asr_sentence_min_chars": {
+    "description": "旧 streaming_zipformer 断句参数：允许输出的最小字符数",
+    "type": "int",
+    "default": 1
+  },
+  "singer_mode_enabled": {
+    "description": "是否启用 Singer Mode 判断",
+    "type": "bool",
+    "default": true
+  },
+  "singer_mode_threshold": {
+    "description": "Singer Mode 触发阈值",
+    "type": "float",
+    "default": 0.3
   }
 }
