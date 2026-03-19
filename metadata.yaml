@@ -1,6 +1,6 @@
 name: astrbot_plugin_bilibililive_watcher
 display_name: B站弹幕热度监听器
-desc: 定时抓取B站直播间弹幕，达到阈值后触发模型生成简短弹幕并发送到指定会话。
-version: v1.0.0
-author: YourName
-repo: https://github.com/yourname/astrbot_plugin_bilibililive_watcher
+desc: 定时抓取 B 站直播间弹幕与语音上下文，触发模型生成短回复，并可双通道发送到 AstrBot 与 B 站直播弹幕。
+version: v1.1.0
+author: qingquanlingyu
+repo: https://github.com/qingquanlingyu/astrbot_plugin_bilibililive_watcher

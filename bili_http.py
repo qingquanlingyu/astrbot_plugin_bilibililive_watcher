@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
+from http.cookies import SimpleCookie
 from typing import Any
+from urllib.parse import parse_qsl, urlparse
 
 import aiohttp
 
@@ -27,11 +29,50 @@ class DanmuInfoAuthError(BiliApiError):
     pass
 
 
+class BiliLoginRequiredError(BiliApiError):
+    pass
+
+
 @dataclass(slots=True)
 class RoomPromptMeta:
     room_title: str = ""
     anchor_name: str = ""
     live_status: int | None = None
+
+
+@dataclass(slots=True)
+class BiliLiveSendResult:
+    code: int
+    message: str
+    detail: str = ""
+
+
+@dataclass(slots=True)
+class BiliLoginAccount:
+    is_logged_in: bool
+    uid: str = ""
+    uname: str = ""
+    face: str = ""
+    source: str = ""
+    message: str = ""
+
+
+@dataclass(slots=True)
+class BiliQrLoginSession:
+    qrcode_key: str
+    url: str
+    expires_in_seconds: int = 180
+
+
+@dataclass(slots=True)
+class BiliQrLoginPollResult:
+    status: str
+    code: int
+    message: str
+    cookie: str = ""
+    refresh_token: str = ""
+    account: BiliLoginAccount | None = None
+    raw_url: str = ""
 
 
 class BiliHttpClient:
@@ -117,6 +158,112 @@ class BiliHttpClient:
             live_status=live_status,
         )
 
+    async def get_login_account(self, cookie: str = "") -> BiliLoginAccount:
+        headers = {
+            "User-Agent": DEFAULT_UA,
+            "Referer": "https://www.bilibili.com/",
+            "Origin": "https://www.bilibili.com",
+        }
+        if cookie:
+            headers["Cookie"] = cookie
+        async with self._session.get(
+            "https://api.bilibili.com/x/web-interface/nav",
+            headers=headers,
+            timeout=10,
+        ) as resp:
+            payload = await resp.json(content_type=None)
+
+        if int(payload.get("code", -1)) != 0:
+            return BiliLoginAccount(
+                is_logged_in=False,
+                source="nav",
+                message=f"nav failed: code={payload.get('code')} msg={payload.get('message')}",
+            )
+
+        data = payload.get("data", {}) or {}
+        is_logged_in = bool(data.get("isLogin")) or int(data.get("mid", 0) or 0) > 0
+        return BiliLoginAccount(
+            is_logged_in=is_logged_in,
+            uid=str(data.get("mid", "") or "").strip(),
+            uname=str(data.get("uname", "") or "").strip(),
+            face=str(data.get("face", "") or "").strip(),
+            source="nav",
+            message="ok" if is_logged_in else "not_logged_in",
+        )
+
+    async def generate_login_qrcode(self) -> BiliQrLoginSession:
+        async with self._session.get(
+            "https://passport.bilibili.com/x/passport-login/web/qrcode/generate",
+            headers={
+                "User-Agent": DEFAULT_UA,
+                "Referer": "https://www.bilibili.com/",
+                "Origin": "https://www.bilibili.com",
+            },
+            timeout=10,
+        ) as resp:
+            payload = await resp.json(content_type=None)
+
+        if int(payload.get("code", -1)) != 0:
+            raise BiliApiError(
+                f"qrcode generate failed: code={payload.get('code')} msg={payload.get('message')}"
+            )
+
+        data = payload.get("data", {}) or {}
+        url = str(data.get("url", "") or "").strip()
+        qrcode_key = str(data.get("qrcode_key", "") or "").strip()
+        if not url or not qrcode_key:
+            raise BiliApiError("qrcode generate returned empty url/qrcode_key")
+        return BiliQrLoginSession(qrcode_key=qrcode_key, url=url, expires_in_seconds=180)
+
+    async def poll_login_qrcode(self, qrcode_key: str) -> BiliQrLoginPollResult:
+        async with self._session.get(
+            "https://passport.bilibili.com/x/passport-login/web/qrcode/poll",
+            params={"qrcode_key": qrcode_key},
+            headers={
+                "User-Agent": DEFAULT_UA,
+                "Referer": "https://www.bilibili.com/",
+                "Origin": "https://www.bilibili.com",
+            },
+            timeout=10,
+        ) as resp:
+            payload = await resp.json(content_type=None)
+            response_headers = resp.headers
+
+        if int(payload.get("code", -1)) != 0:
+            raise BiliApiError(
+                f"qrcode poll failed: code={payload.get('code')} msg={payload.get('message')}"
+            )
+
+        data = payload.get("data", {}) or {}
+        raw_code = int(data.get("code", -1))
+        raw_message = str(data.get("message", "") or payload.get("message", "") or "").strip()
+        raw_url = str(data.get("url", "") or "").strip()
+        refresh_token = str(data.get("refresh_token", "") or "").strip()
+
+        status = self._normalize_qr_poll_status(raw_code=raw_code, raw_message=raw_message)
+        cookie = ""
+        account = None
+        if status == "confirmed":
+            cookie = self._extract_cookie_from_qr_poll_payload(
+                data=data,
+                response_headers=response_headers,
+            )
+            if cookie:
+                try:
+                    account = await self.get_login_account(cookie)
+                except Exception:
+                    account = None
+
+        return BiliQrLoginPollResult(
+            status=status,
+            code=raw_code,
+            message=raw_message or status,
+            cookie=cookie,
+            refresh_token=refresh_token,
+            account=account,
+            raw_url=raw_url,
+        )
+
     async def get_history_danmaku(self, room_id: int, cookie: str = "") -> list[DanmakuItem]:
         headers = self.make_headers(cookie=cookie, room_id=room_id)
         async with self._session.get(
@@ -196,6 +343,53 @@ class BiliHttpClient:
                 f"getDanmuInfo failed: code={code} msg={payload.get('message')}"
             )
         return {}
+
+    async def send_live_danmaku(
+        self,
+        room_id: int,
+        message: str,
+        cookie: str = "",
+    ) -> BiliLiveSendResult:
+        csrf = self._extract_cookie_value(cookie, "bili_jct")
+        if not cookie or not csrf:
+            raise BiliLoginRequiredError("missing bilibili login cookie or bili_jct csrf token")
+
+        payload = {
+            "bubble": 0,
+            "msg": str(message or "").strip(),
+            "color": 16777215,
+            "mode": 1,
+            "fontsize": 25,
+            "rnd": int(time.time()),
+            "roomid": int(room_id or 0),
+            "csrf": csrf,
+            "csrf_token": csrf,
+            "dm_type": 0,
+        }
+        headers = self.make_headers(cookie=cookie, room_id=room_id)
+        headers.update(
+            {
+                "Accept": "application/json, text/plain, */*",
+                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                "X-Requested-With": "XMLHttpRequest",
+            }
+        )
+        async with self._session.post(
+            "https://api.live.bilibili.com/msg/send",
+            data=payload,
+            headers=headers,
+            timeout=10,
+        ) as resp:
+            result = await resp.json(content_type=None)
+
+        code = int(result.get("code", -1))
+        message_text = str(result.get("message", "") or result.get("msg", "") or "").strip()
+        detail = str(result.get("data", "") or "").strip()
+        if code == 0:
+            return BiliLiveSendResult(code=code, message=message_text or "ok", detail=detail)
+        if code == -101:
+            raise BiliLoginRequiredError(f"send live danmaku failed: code={code} msg={message_text}")
+        raise BiliApiError(f"send live danmaku failed: code={code} msg={message_text}")
 
     async def get_room_play_urls(
         self,
@@ -324,3 +518,143 @@ class BiliHttpClient:
         if cookie:
             headers["Cookie"] = cookie
         return headers
+
+    def _normalize_qr_poll_status(self, *, raw_code: int, raw_message: str) -> str:
+        mapping = {
+            0: "confirmed",
+            86038: "expired",
+            86090: "waiting_confirm",
+            86101: "waiting_scan",
+        }
+        if raw_code in mapping:
+            return mapping[raw_code]
+        text = str(raw_message or "").lower()
+        if "expired" in text or "失效" in text:
+            return "expired"
+        if "未确认" in text or "confirm" in text:
+            return "waiting_confirm"
+        if "未扫码" in text or "scan" in text:
+            return "waiting_scan"
+        if raw_code == 0:
+            return "confirmed"
+        return "error"
+
+    def _extract_cookie_from_qr_poll_payload(
+        self,
+        *,
+        data: dict[str, Any],
+        response_headers: aiohttp.typedefs.LooseHeaders,
+    ) -> str:
+        cookie_items: dict[str, str] = {}
+        self._merge_cookie_pairs(cookie_items, self._extract_cookie_pairs_from_cookie_info(data))
+
+        for key in ("url", "redirect_url"):
+            raw_url = str(data.get(key, "") or "").strip()
+            if raw_url:
+                self._merge_cookie_pairs(cookie_items, self._extract_cookie_pairs_from_url(raw_url))
+
+        set_cookie_headers: list[str] = []
+        if hasattr(response_headers, "getall"):
+            try:
+                set_cookie_headers = list(response_headers.getall("Set-Cookie", []))
+            except Exception:
+                set_cookie_headers = []
+        self._merge_cookie_pairs(
+            cookie_items,
+            self._extract_cookie_pairs_from_set_cookie_headers(set_cookie_headers),
+        )
+        return self._build_cookie_string(cookie_items)
+
+    def _extract_cookie_pairs_from_cookie_info(self, data: dict[str, Any]) -> dict[str, str]:
+        cookie_info = data.get("cookie_info", {}) or {}
+        raw_cookies = cookie_info.get("cookies", []) or []
+        result: dict[str, str] = {}
+        for row in raw_cookies:
+            if not isinstance(row, dict):
+                continue
+            name = str(row.get("name", "") or "").strip()
+            value = str(row.get("value", "") or "").strip()
+            if name and value:
+                result[name] = value
+        return result
+
+    def _extract_cookie_pairs_from_url(self, raw_url: str) -> dict[str, str]:
+        parsed = urlparse(raw_url)
+        items = dict(parse_qsl(parsed.query, keep_blank_values=True))
+        if parsed.fragment:
+            items.update(dict(parse_qsl(parsed.fragment, keep_blank_values=True)))
+
+        nested_url = str(items.get("gourl", "") or items.get("go_url", "") or "").strip()
+        if nested_url:
+            items.update(self._extract_cookie_pairs_from_url(nested_url))
+
+        result: dict[str, str] = {}
+        for key in (
+            "SESSDATA",
+            "bili_jct",
+            "DedeUserID",
+            "DedeUserID__ckMd5",
+            "sid",
+            "buvid3",
+            "buvid4",
+            "ac_time_value",
+        ):
+            value = str(items.get(key, "") or "").strip()
+            if value:
+                result[key] = value
+        return result
+
+    def _extract_cookie_pairs_from_set_cookie_headers(self, set_cookie_headers: list[str]) -> dict[str, str]:
+        result: dict[str, str] = {}
+        for header in set_cookie_headers:
+            jar = SimpleCookie()
+            try:
+                jar.load(header)
+            except Exception:
+                continue
+            for key, morsel in jar.items():
+                value = str(getattr(morsel, "value", "") or "").strip()
+                if key and value:
+                    result[key] = value
+        return result
+
+    def _merge_cookie_pairs(self, target: dict[str, str], source: dict[str, str]) -> None:
+        for key, value in source.items():
+            if key and value:
+                target[key] = value
+
+    def _build_cookie_string(self, cookie_items: dict[str, str]) -> str:
+        if not cookie_items:
+            return ""
+        ordered_keys = [
+            "SESSDATA",
+            "bili_jct",
+            "DedeUserID",
+            "DedeUserID__ckMd5",
+            "sid",
+            "buvid3",
+            "buvid4",
+            "ac_time_value",
+        ]
+        parts: list[str] = []
+        seen: set[str] = set()
+        for key in ordered_keys:
+            value = str(cookie_items.get(key, "") or "").strip()
+            if value:
+                parts.append(f"{key}={value}")
+                seen.add(key)
+        for key, value in cookie_items.items():
+            if key in seen:
+                continue
+            sval = str(value or "").strip()
+            if sval:
+                parts.append(f"{key}={sval}")
+        return "; ".join(parts)
+
+    def _extract_cookie_value(self, cookie: str, key: str) -> str:
+        prefix = f"{key}="
+        for part in str(cookie or "").split(";"):
+            item = part.strip()
+            if item.startswith(prefix):
+                return item[len(prefix) :].strip()
+        return ""

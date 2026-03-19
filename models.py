@@ -32,11 +32,11 @@ class FusionSummary:
     danmaku_count: int
     asr_sentence_count: int = 0
     top_keywords: list[str] = field(default_factory=list)
-    emotion: str = "neutral"
     asr_recent_topics: list[str] = field(default_factory=list)
     asr_samples: list[str] = field(default_factory=list)
     asr_confidence: float = 0.0
     scene_mode: str = "chat"
     constraints: list[str] = field(default_factory=list)
-    singer_score: float = 0.0
+    singer_hit_keywords: list[str] = field(default_factory=list)
+    singer_window_seconds: int = 0
     ordered_context: list[dict] = field(default_factory=list)

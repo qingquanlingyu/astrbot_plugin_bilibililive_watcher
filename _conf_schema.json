@@ -15,9 +15,9 @@
     "default": 0
   },
   "pipeline_mode": {
-    "description": "管线模式：danmu_only / danmu_plus_asr / asr_only",
-    "type": "string",
-    "default": "danmu_plus_asr"
+    "description": "管线模式：0仅弹幕；1仅语音；2合并；非法值默认 0",
+    "type": "int",
+    "default": 2
   },
   "reply_interval_seconds": {
     "description": "统一循环时间（秒）：同时用于主循环检查与 history 轮询",
@@ -65,59 +65,24 @@
     "default": 30
   },
   "bili_cookie": {
-    "description": "B 站 Cookie 字符串（推荐字段名；兼容 bilibili_cookie）",
+    "description": "B 站 Cookie 字符串",
     "type": "string",
     "default": ""
   },
-  "bili_cookie_file": {
-    "description": "Cookie 文件路径（推荐字段名；兼容 bilibili_cookie_file）",
+  "bili_login_cookie": {
+    "description": "插件内二维码登录成功后写入的可复制 Cookie 字符串；可手工复制到“B 站 Cookie 字符串”做备份",
     "type": "string",
-    "default": "~/.bilibili-cookie.json"
+    "default": ""
   },
-  "auto_load_cookie_from_file": {
-    "description": "当 cookie 为空时是否自动读取 cookie 文件",
+  "sync_to_bilibili_live": {
+    "description": "是否在发送到 AstrBot 会话的同时，同步发送到 B 站直播弹幕；默认关闭",
     "type": "bool",
-    "default": true
-  },
-  "use_realtime_danmaku_ws": {
-    "description": "是否优先使用实时弹幕 WebSocket",
-    "type": "bool",
-    "default": true
-  },
-  "danmu_ws_auth_mode": {
-    "description": "实时弹幕鉴权模式：history_only / signed_wbi",
-    "type": "string",
-    "default": "signed_wbi"
-  },
-  "allow_buvid3_only": {
-    "description": "实时弹幕鉴权时是否优先只带 buvid3",
-    "type": "bool",
-    "default": true
-  },
-  "wbi_sign_enabled": {
-    "description": "是否对 getDanmuInfo 启用 WBI 签名",
-    "type": "bool",
-    "default": true
-  },
-  "audio_enabled": {
-    "description": "在 danmu_plus_asr / asr_only 模式下是否启用音频拉流",
-    "type": "bool",
-    "default": true
+    "default": false
   },
   "audio_pull_protocol": {
     "description": "音频拉流协议：http_flv / hls",
     "type": "string",
     "default": "http_flv"
-  },
-  "audio_pull_api_preference": {
-    "description": "音频拉流 API 优先级：getRoomPlayInfo / playUrl",
-    "type": "string",
-    "default": "getRoomPlayInfo"
-  },
-  "audio_http_headers_enabled": {
-    "description": "ffmpeg 拉流时是否注入 Referer/Origin/User-Agent/Cookie",
-    "type": "bool",
-    "default": true
   },
   "ffmpeg_path": {
     "description": "ffmpeg 可执行文件路径",
@@ -174,16 +139,6 @@
     "type": "string",
     "default": "auto"
   },
-  "asr_sense_voice_use_itn": {
-    "description": "SenseVoice 是否启用 ITN",
-    "type": "bool",
-    "default": true
-  },
-  "asr_runtime_probe_required": {
-    "description": "是否要求先通过运行时探测再启用 ASR",
-    "type": "bool",
-    "default": true
-  },
   "asr_threads": {
     "description": "ASR 线程 / RKNN NPU core mask（RKNN 推荐 1；兼容 0/-1/-2/-3/-4）",
     "type": "int",
@@ -209,9 +164,14 @@
     "type": "bool",
     "default": true
   },
-  "singer_mode_threshold": {
-    "description": "Singer Mode 触发阈值",
-    "type": "float",
-    "default": 0.3
+  "singer_mode_keywords": {
+    "description": "Singer Mode 关键词数组；当最近窗口内弹幕包含任一关键词时，判定为唱歌场景",
+    "type": "list",
+    "default": ["好听", "打call", "天籁之音", "/\\"]
+  },
+  "singer_mode_window_seconds": {
+    "description": "Singer Mode 判定窗口（秒）；以最近弹幕为基准回看该时间内是否命中关键词",
+    "type": "int",
+    "default": 20
   }
 }

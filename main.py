@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,25 +15,41 @@ from astrbot.api.star import Context, Star, register
 from astrbot.core.provider.entities import ProviderRequest
 
 try:  # pragma: no cover
+    import qrcode
+except Exception:  # pragma: no cover
+    qrcode = None
+
+try:  # pragma: no cover
     from .asr_sherpa import SherpaASRWorker, build_asr_worker_or_none
     from .audio_pipe import AudioCaptureWorker, AudioRequestOptions
     from .bili_auth import extract_buvid3
-    from .bili_http import BiliHttpClient, DEFAULT_UA
+    from .bili_http import (
+        BiliApiError,
+        BiliHttpClient,
+        BiliLoginAccount,
+        BiliLoginRequiredError,
+        DEFAULT_UA,
+    )
     from .bili_ws import DanmakuRealtimeClient
-    from .fusion import FusionEngine
+    from .fusion import DEFAULT_SINGER_KEYWORDS, FusionEngine
     from .models import ASRSegment, DanmakuItem
     from .prompting import build_fused_prompt
 except ImportError:  # pragma: no cover
     from asr_sherpa import SherpaASRWorker, build_asr_worker_or_none
     from audio_pipe import AudioCaptureWorker, AudioRequestOptions
     from bili_auth import extract_buvid3
-    from bili_http import BiliHttpClient, DEFAULT_UA
+    from bili_http import (
+        BiliApiError,
+        BiliHttpClient,
+        BiliLoginAccount,
+        BiliLoginRequiredError,
+        DEFAULT_UA,
+    )
     from bili_ws import DanmakuRealtimeClient
-    from fusion import FusionEngine
+    from fusion import DEFAULT_SINGER_KEYWORDS, FusionEngine
     from models import ASRSegment, DanmakuItem
     from prompting import build_fused_prompt
 
-DEFAULT_COOKIE_FILE = "~/.bilibili-cookie.json"
 DEFAULT_ASR_MODEL_DIR = (
     "./models/sherpa/rknn/"
     "sherpa-onnx-rk3588-20-seconds-sense-voice-zh-en-ja-ko-yue-2024-07-17"
@@ -41,6 +59,29 @@ DEFAULT_CONVERSATION_CONTEXT_LIMIT = 12
 DEFAULT_CONTEXT_WINDOW_MULTIPLIER = 3
 DEFAULT_PCM_GAP_LOG_SECONDS = 2.0
 DEFAULT_PCM_HEARTBEAT_SECONDS = 5.0
+INTERNAL_USE_REALTIME_DANMAKU_WS = True
+INTERNAL_DANMU_WS_AUTH_MODE = "signed_wbi"
+INTERNAL_ALLOW_BUVID3_ONLY = True
+INTERNAL_WBI_SIGN_ENABLED = True
+INTERNAL_AUDIO_PULL_API_PREFERENCE = "getRoomPlayInfo"
+INTERNAL_AUDIO_HTTP_HEADERS_ENABLED = True
+INTERNAL_ASR_SENSE_VOICE_USE_ITN = True
+INTERNAL_ASR_RUNTIME_PROBE_REQUIRED = True
+HIDDEN_LEGACY_CONFIG_KEYS = (
+    "bili_cookie_file",
+    "bilibili_cookie_file",
+    "auto_load_cookie_from_file",
+    "audio_enabled",
+    "singer_mode_threshold",
+    "use_realtime_danmaku_ws",
+    "danmu_ws_auth_mode",
+    "allow_buvid3_only",
+    "wbi_sign_enabled",
+    "audio_pull_api_preference",
+    "audio_http_headers_enabled",
+    "asr_sense_voice_use_itn",
+    "asr_runtime_probe_required",
+)
 PLUGIN_DIR = Path(__file__).resolve().parent
 
 
@@ -59,14 +100,18 @@ class WatchConfig:
     target_id: str
     max_reply_chars: int
     bilibili_cookie: str
-    bilibili_cookie_file: str
-    auto_load_cookie_from_file: bool
+    bilibili_cookie_source: str
+    sync_to_bilibili_live: bool
+    bili_login_cookie: str
+    bili_login_uid: str
+    bili_login_uname: str
+    bili_login_refresh_token: str
+    bili_login_saved_at: int
     pipeline_mode: str
     use_realtime_danmaku_ws: bool
     danmu_ws_auth_mode: str
     allow_buvid3_only: bool
     wbi_sign_enabled: bool
-    audio_enabled: bool
     audio_pull_protocol: str
     audio_pull_api_preference: str
     audio_http_headers_enabled: bool
@@ -88,7 +133,32 @@ class WatchConfig:
     asr_sentence_pause_seconds: float
     asr_sentence_min_chars: int
     singer_mode_enabled: bool
-    singer_mode_threshold: float
+    singer_mode_keywords: list[str]
+    singer_mode_window_seconds: int
+
+
+@dataclass(slots=True)
+class ChannelSendState:
+    channel: str
+    enabled: bool = False
+    last_attempt_ts: float = 0.0
+    last_success_ts: float = 0.0
+    ok: bool | None = None
+    summary: str = "never"
+    error: str = ""
+    text_preview: str = ""
+
+
+@dataclass(slots=True)
+class LoginRuntimeState:
+    qrcode_key: str = ""
+    url: str = ""
+    image_path: str = ""
+    status: str = "idle"
+    message: str = ""
+    started_ts: float = 0.0
+    expires_at: float = 0.0
+    completed_ts: float = 0.0
 
 
 @register(
@@ -136,6 +206,12 @@ class BilibiliLiveWatcherPlugin(Star):
         self._pcm_last_heartbeat_ts = 0.0
         self._fusion = FusionEngine()
         self._live_context_tool_turns: dict[str, float] = {}
+        self._astrbot_send_state = ChannelSendState(channel="astrbot", enabled=True)
+        self._bili_live_send_state = ChannelSendState(channel="bilibili_live", enabled=False)
+        self._login_runtime = LoginRuntimeState()
+        self._login_poll_task: asyncio.Task | None = None
+        self._account_status_cache: BiliLoginAccount | None = None
+        self._account_status_cache_ts = 0.0
 
     async def initialize(self):
         if self._task and not self._task.done():
@@ -150,6 +226,12 @@ class BilibiliLiveWatcherPlugin(Star):
             self._task.cancel()
             await asyncio.gather(self._task, return_exceptions=True)
             self._task = None
+
+        if self._login_poll_task:
+            self._login_poll_task.cancel()
+            await asyncio.gather(self._login_poll_task, return_exceptions=True)
+            self._login_poll_task = None
+        self._cleanup_login_qrcode_image()
 
         await self._stop_runtime_clients()
 
@@ -168,12 +250,18 @@ class BilibiliLiveWatcherPlugin(Star):
             "/biliwatch toggle [on|off] - 开关插件",
             "/biliwatch room <room_id> - 设置监听直播间",
             "/biliwatch bind - 绑定当前会话为发送目标",
+            "/biliwatch sync-live [on|off] - 开关同步发送到 B 站直播弹幕",
+            "/biliwatch login - 发起 B 站二维码登录（实验性）",
+            "/biliwatch login status - 查看二维码登录进度与账号状态",
+            "/biliwatch logout - 清除插件内保存的 B 站登录态",
         ]
         yield event.plain_result("\n".join(lines))
 
     @filter.command("biliwatch status")
     async def biliwatch_status(self, event: AstrMessageEvent):
         cfg = self._load_config()
+        self._astrbot_send_state.enabled = True
+        self._bili_live_send_state.enabled = cfg.sync_to_bilibili_live
         target_umo = self._resolve_target_umo(cfg)
         platform_ids = self._get_available_platform_ids()
         last_trigger = "never"
@@ -185,6 +273,7 @@ class BilibiliLiveWatcherPlugin(Star):
         ws_status = "disabled"
         if self._ws_client is not None:
             ws_status = f"connected={self._ws_client.connected} fatal={self._ws_client.fatal_error or '-'}"
+        account_status = await self._get_bili_account_status(cfg, refresh=False)
         yield event.plain_result(
             "\n".join(
                 [
@@ -194,6 +283,12 @@ class BilibiliLiveWatcherPlugin(Star):
                     f"room_id: {cfg.room_id}",
                     f"target: {target_umo or '(未配置)'}",
                     f"platform_ids: {platform_ids or '[]'}",
+                    f"bili_cookie_source: {cfg.bilibili_cookie_source}",
+                    f"bili_live_sync_enabled: {cfg.sync_to_bilibili_live}",
+                    f"bili_login_status: {self._format_account_status(account_status)}",
+                    f"bili_login_runtime: {self._format_login_runtime_status()}",
+                    f"astrbot_send: {self._format_channel_send_state(self._astrbot_send_state)}",
+                    f"bili_live_send: {self._format_channel_send_state(self._bili_live_send_state)}",
                     f"reply_interval_seconds: {cfg.reply_interval_seconds}",
                     f"context_window_seconds: {cfg.context_window_seconds}",
                     f"danmaku_trigger_threshold: {cfg.danmaku_trigger_threshold}",
@@ -277,6 +372,125 @@ class BilibiliLiveWatcherPlugin(Star):
         suffix = "（已保存）" if saved else "（运行时已生效，未持久化）"
         state = "开启" if new_value else "关闭"
         yield event.plain_result(f"已{state} B站直播监听 {suffix}")
+
+    @filter.command("biliwatch sync-live")
+    async def biliwatch_sync_live(self, event: AstrMessageEvent, value: str = ""):
+        raw = str(value or "").strip().lower()
+        if not raw:
+            parts = event.message_str.strip().split()
+            if len(parts) >= 3:
+                raw = parts[-1].strip().lower()
+
+        current = self._to_bool(self.config.get("sync_to_bilibili_live", False), False)
+        if raw in ("on", "enable", "enabled", "true", "1", "开", "开启"):
+            new_value = True
+        elif raw in ("off", "disable", "disabled", "false", "0", "关", "关闭"):
+            new_value = False
+        else:
+            new_value = not current
+
+        self._set_config_value("sync_to_bilibili_live", new_value)
+        self._bili_live_send_state.enabled = new_value
+        saved = self._save_config_if_possible()
+        suffix = "（已保存）" if saved else "（运行时已生效，未持久化）"
+        state = "开启" if new_value else "关闭"
+        yield event.plain_result(f"已{state}同步发送到 B 站直播弹幕 {suffix}")
+
+    @filter.command("biliwatch login")
+    async def biliwatch_login(self, event: AstrMessageEvent, action: str = ""):
+        raw = str(action or "").strip().lower()
+        if not raw:
+            parts = event.message_str.strip().split()
+            if len(parts) >= 3:
+                raw = parts[2].strip().lower()
+
+        if raw == "status":
+            cfg = self._load_config()
+            account_status = await self._get_bili_account_status(cfg, refresh=True)
+            yield event.plain_result(
+                "\n".join(
+                    [
+                        f"login_runtime: {self._format_login_runtime_status()}",
+                        f"bili_login_status: {self._format_account_status(account_status)}",
+                        "说明：二维码登录为实验性能力，如失败可回退到 bili_cookie。",
+                    ]
+                )
+            )
+            return
+
+        if self._http is None:
+            yield event.plain_result("HTTP 客户端未初始化，请稍后重试。")
+            return
+
+        if self._login_poll_task and not self._login_poll_task.done():
+            seconds_left = max(0, int(self._login_runtime.expires_at - time.time()))
+            yield event.plain_result(
+                "\n".join(
+                    [
+                        "已有二维码登录流程正在进行中。",
+                        f"status: {self._login_runtime.status}",
+                        f"url: {self._login_runtime.url or '(空)'}",
+                        f"expires_in_seconds: {seconds_left}",
+                        "可用 /biliwatch login status 查看最新进度。",
+                    ]
+                )
+            )
+            return
+
+        try:
+            qr_session = await self._http.generate_login_qrcode()
+        except Exception as e:
+            yield event.plain_result(
+                "发起二维码登录失败："
+                f"{self._sanitize_error_message(e)}\n"
+                "说明：二维码登录为实验性能力，可回退到 bili_cookie。"
+            )
+            return
+
+        self._cleanup_login_qrcode_image()
+        qr_image_path = self._build_login_qrcode_image(qr_session.url)
+        self._login_runtime = LoginRuntimeState(
+            qrcode_key=qr_session.qrcode_key,
+            url=qr_session.url,
+            image_path=qr_image_path or "",
+            status="waiting_scan",
+            message="waiting_scan",
+            started_ts=time.time(),
+            expires_at=time.time() + max(30, qr_session.expires_in_seconds),
+            completed_ts=0.0,
+        )
+        self._login_poll_task = asyncio.create_task(
+            self._poll_login_until_complete(),
+            name="bili-login-poll",
+        )
+        if qr_image_path:
+            try:
+                yield event.image_result(qr_image_path)
+            except Exception as e:
+                logger.warning("[bili_watcher] send login qrcode image failed: %s", e)
+        yield event.plain_result(
+            "\n".join(
+                [
+                    "已发起 B 站二维码登录（实验性）。",
+                    f"qrcode_image: {'sent' if qr_image_path else 'unavailable'}",
+                    f"login_url: {qr_session.url}",
+                    f"qrcode_key: {self._mask_qrcode_key(qr_session.qrcode_key)}",
+                    "说明：若上方图片未显示，请直接打开 login_url。",
+                    "请在扫码后使用 /biliwatch login status 查看确认结果。",
+                ]
+            )
+        )
+
+    @filter.command("biliwatch logout")
+    async def biliwatch_logout(self, event: AstrMessageEvent):
+        await self._clear_persisted_login_state(clear_manual_cookie=False)
+        saved = self._save_config_if_possible()
+        suffix = "（已保存）" if saved else "（运行时已生效，未持久化）"
+        cfg = self._load_config()
+        fallback_hint = ""
+        if cfg.bilibili_cookie_source == "config":
+            fallback_hint = "\n注意：当前仍存在手工 bili_cookie 回退来源，B 站发送仍可能继续可用。"
+        yield event.plain_result(f"已清除插件内保存的 B 站登录态 {suffix}{fallback_hint}")
 
     @filter.llm_tool(name="bili_live_context_window")
     async def bili_live_context_window(self, event: AstrMessageEvent):
@@ -434,11 +648,12 @@ class BilibiliLiveWatcherPlugin(Star):
             logger.warning("[bili_watcher] 模型未生成有效内容，本次不发送")
             return
 
-        ok = await self.context.send_message(target_umo, MessageChain().message(reply))
-        if ok:
-            logger.info(f"[bili_watcher] sent to {target_umo}, room={room_id}, text={reply[:120]}")
-        else:
-            logger.warning(f"[bili_watcher] send_message failed, target={target_umo}")
+        await self._dispatch_reply(
+            cfg=cfg,
+            target_umo=target_umo,
+            room_id=room_id,
+            reply=reply,
+        )
 
     async def _ensure_runtime(self, cfg: WatchConfig, room_id: int):
         if self._runtime_room_id != room_id:
@@ -495,7 +710,7 @@ class BilibiliLiveWatcherPlugin(Star):
         await self._ws_client.start()
 
     async def _ensure_audio_runtime(self, cfg: WatchConfig, room_id: int):
-        audio_enabled = cfg.pipeline_mode in ("danmu_plus_asr", "asr_only") and cfg.audio_enabled
+        audio_enabled = cfg.pipeline_mode in ("danmu_plus_asr", "asr_only")
         if not audio_enabled:
             await self._stop_audio_runtime()
             return
@@ -859,16 +1074,19 @@ class BilibiliLiveWatcherPlugin(Star):
             asr_segments=asr_segments,
             window_seconds=cfg.context_window_seconds,
             singer_mode_enabled=cfg.singer_mode_enabled,
-            singer_mode_threshold=cfg.singer_mode_threshold,
+            singer_mode_keywords=cfg.singer_mode_keywords,
+            singer_mode_window_seconds=cfg.singer_mode_window_seconds,
         )
         fusion.ordered_context = self._build_ordered_context(
             danmaku_items=danmaku_items,
             asr_segments=asr_segments,
         )
+        account_status = await self._get_bili_account_status(cfg, refresh=False)
         prompt = build_fused_prompt(
             room_id=room_id,
             room_title=room_meta.get("room_title", ""),
             anchor_name=room_meta.get("anchor_name", ""),
+            self_bili_nickname=str(getattr(account_status, "uname", "") or cfg.bili_login_uname or "").strip(),
             fusion=fusion,
             max_reply_chars=cfg.max_reply_chars,
         )
@@ -884,6 +1102,151 @@ class BilibiliLiveWatcherPlugin(Star):
         if not text:
             return ""
         return text
+
+    async def _dispatch_reply(
+        self,
+        *,
+        cfg: WatchConfig,
+        target_umo: str,
+        room_id: int,
+        reply: str,
+    ) -> None:
+        self._astrbot_send_state.enabled = True
+        self._bili_live_send_state.enabled = cfg.sync_to_bilibili_live
+        await self._send_astrbot_reply(target_umo=target_umo, room_id=room_id, reply=reply)
+        if cfg.sync_to_bilibili_live:
+            await self._send_bili_live_reply(cfg=cfg, room_id=room_id, reply=reply)
+
+    async def _send_astrbot_reply(self, *, target_umo: str, room_id: int, reply: str) -> None:
+        try:
+            ok = await self.context.send_message(target_umo, MessageChain().message(reply))
+        except Exception as e:
+            self._record_channel_send_result(
+                self._astrbot_send_state,
+                ok=False,
+                summary="exception",
+                error=self._sanitize_error_message(e),
+                text_preview=reply,
+            )
+            logger.warning("[bili_watcher] send_message exception, target=%s err=%s", target_umo, e)
+            return
+
+        if ok:
+            self._record_channel_send_result(
+                self._astrbot_send_state,
+                ok=True,
+                summary=f"sent target={target_umo}",
+                error="",
+                text_preview=reply,
+            )
+            logger.info(f"[bili_watcher] sent to {target_umo}, room={room_id}, text={reply[:120]}")
+            return
+
+        self._record_channel_send_result(
+            self._astrbot_send_state,
+            ok=False,
+            summary=f"failed target={target_umo}",
+            error="send_message returned false",
+            text_preview=reply,
+        )
+        logger.warning(f"[bili_watcher] send_message failed, target={target_umo}")
+
+    async def _send_bili_live_reply(self, *, cfg: WatchConfig, room_id: int, reply: str) -> None:
+        if self._http is None:
+            self._record_channel_send_result(
+                self._bili_live_send_state,
+                ok=False,
+                summary="http_client_unavailable",
+                error="BiliHttpClient is not initialized",
+                text_preview=reply,
+            )
+            return
+
+        if not cfg.bilibili_cookie:
+            self._record_channel_send_result(
+                self._bili_live_send_state,
+                ok=False,
+                summary="not_logged_in",
+                error="no effective bilibili cookie available",
+                text_preview=reply,
+            )
+            return
+
+        try:
+            result = await self._http.send_live_danmaku(
+                room_id=room_id,
+                message=reply,
+                cookie=cfg.bilibili_cookie,
+            )
+            self._record_channel_send_result(
+                self._bili_live_send_state,
+                ok=True,
+                summary=f"sent code={result.code} msg={result.message or 'ok'}",
+                error="",
+                text_preview=reply,
+            )
+            logger.info(
+                "[bili_watcher] sent live danmaku room=%s source=%s text=%s",
+                room_id,
+                cfg.bilibili_cookie_source,
+                reply[:120],
+            )
+            return
+        except BiliLoginRequiredError as e:
+            self._account_status_cache = BiliLoginAccount(
+                is_logged_in=False,
+                source=cfg.bilibili_cookie_source,
+                message="login_required",
+            )
+            self._account_status_cache_ts = time.time()
+            self._record_channel_send_result(
+                self._bili_live_send_state,
+                ok=False,
+                summary="login_required",
+                error=self._sanitize_error_message(e),
+                text_preview=reply,
+            )
+        except BiliApiError as e:
+            self._record_channel_send_result(
+                self._bili_live_send_state,
+                ok=False,
+                summary="api_error",
+                error=self._sanitize_error_message(e),
+                text_preview=reply,
+            )
+        except Exception as e:
+            self._record_channel_send_result(
+                self._bili_live_send_state,
+                ok=False,
+                summary="exception",
+                error=self._sanitize_error_message(e),
+                text_preview=reply,
+            )
+        logger.warning(
+            "[bili_watcher] live danmaku send failed room=%s source=%s summary=%s error=%s",
+            room_id,
+            cfg.bilibili_cookie_source,
+            self._bili_live_send_state.summary,
+            self._bili_live_send_state.error,
+        )
+
+    def _record_channel_send_result(
+        self,
+        state: ChannelSendState,
+        *,
+        ok: bool,
+        summary: str,
+        error: str,
+        text_preview: str,
+    ) -> None:
+        now = time.time()
+        state.last_attempt_ts = now
+        state.ok = bool(ok)
+        state.summary = str(summary or "").strip() or ("ok" if ok else "failed")
+        state.error = str(error or "").strip()
+        state.text_preview = self._mask_reply_preview(text_preview)
+        if ok:
+            state.last_success_ts = now
 
     def _debug_log(self, message: str, *args):
         if not self._debug_enabled:
@@ -1398,9 +1761,25 @@ class BilibiliLiveWatcherPlugin(Star):
         return str(path)
 
     def _normalize_pipeline_mode(self, raw_mode: object) -> str:
-        mode = str(raw_mode or "danmu_only").strip().lower()
-        if mode in {"danmu_only", "danmu_plus_asr", "asr_only"}:
-            return mode
+        aliases = {
+            0: "danmu_only",
+            1: "asr_only",
+            2: "danmu_plus_asr",
+            "0": "danmu_only",
+            "1": "asr_only",
+            "2": "danmu_plus_asr",
+            "danmu_only": "danmu_only",
+            "asr_only": "asr_only",
+            "danmu_plus_asr": "danmu_plus_asr",
+        }
+        if isinstance(raw_mode, str):
+            mode = raw_mode.strip().lower()
+            return aliases.get(mode, "danmu_only")
+        if isinstance(raw_mode, (int, float)):
+            try:
+                return aliases.get(int(raw_mode), "danmu_only")
+            except Exception:
+                return "danmu_only"
         return "danmu_only"
 
     def _normalize_asr_strategy(self, raw_strategy: object) -> str:
@@ -1417,6 +1796,264 @@ class BilibiliLiveWatcherPlugin(Star):
             return strategy
         return "sensevoice_vad_offline"
 
+    async def _poll_login_until_complete(self) -> None:
+        try:
+            while True:
+                if self._http is None:
+                    self._login_runtime.status = "error"
+                    self._login_runtime.message = "http_client_unavailable"
+                    self._login_runtime.completed_ts = time.time()
+                    return
+                if not self._login_runtime.qrcode_key:
+                    self._login_runtime.status = "error"
+                    self._login_runtime.message = "missing_qrcode_key"
+                    self._login_runtime.completed_ts = time.time()
+                    return
+                if self._login_runtime.expires_at > 0 and time.time() >= self._login_runtime.expires_at:
+                    self._login_runtime.status = "expired"
+                    self._login_runtime.message = "二维码已过期"
+                    self._login_runtime.completed_ts = time.time()
+                    return
+
+                result = await self._http.poll_login_qrcode(self._login_runtime.qrcode_key)
+                self._login_runtime.status = result.status
+                self._login_runtime.message = result.message
+                if result.status in {"waiting_scan", "waiting_confirm"}:
+                    await asyncio.sleep(2.5)
+                    continue
+                if result.status == "confirmed":
+                    await self._persist_login_success(
+                        cookie=result.cookie,
+                        refresh_token=result.refresh_token,
+                        account=result.account,
+                    )
+                    self._login_runtime.status = "confirmed"
+                    self._login_runtime.message = "登录成功"
+                    self._login_runtime.completed_ts = time.time()
+                    return
+                self._login_runtime.completed_ts = time.time()
+                return
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            self._login_runtime.status = "error"
+            self._login_runtime.message = self._sanitize_error_message(e)
+            self._login_runtime.completed_ts = time.time()
+            logger.warning("[bili_watcher] qrcode login poll failed: %s", e)
+
+    async def _persist_login_success(
+        self,
+        *,
+        cookie: str,
+        refresh_token: str,
+        account: BiliLoginAccount | None,
+    ) -> None:
+        if not cookie:
+            raise RuntimeError("qrcode login succeeded but returned empty cookie")
+
+        resolved_account = account
+        if (resolved_account is None or not resolved_account.is_logged_in) and self._http is not None:
+            try:
+                resolved_account = await self._http.get_login_account(cookie)
+            except Exception:
+                resolved_account = account
+
+        self._set_config_value("bili_login_cookie", cookie)
+        self._set_config_value("bili_login_refresh_token", refresh_token)
+        self._set_config_value(
+            "bili_login_uid",
+            str(getattr(resolved_account, "uid", "") or "").strip(),
+        )
+        self._set_config_value(
+            "bili_login_uname",
+            str(getattr(resolved_account, "uname", "") or "").strip(),
+        )
+        self._set_config_value("bili_login_saved_at", int(time.time()))
+        self._save_config_if_possible()
+
+        if resolved_account is not None:
+            self._account_status_cache = resolved_account
+            self._account_status_cache_ts = time.time()
+
+    async def _clear_persisted_login_state(self, *, clear_manual_cookie: bool) -> None:
+        current_task = asyncio.current_task()
+        if self._login_poll_task and self._login_poll_task is not current_task:
+            self._login_poll_task.cancel()
+            await asyncio.gather(self._login_poll_task, return_exceptions=True)
+        self._login_poll_task = None
+        self._cleanup_login_qrcode_image()
+        self._login_runtime = LoginRuntimeState()
+        self._account_status_cache = None
+        self._account_status_cache_ts = 0.0
+
+        self._set_config_value("bili_login_cookie", "")
+        self._set_config_value("bili_login_refresh_token", "")
+        self._set_config_value("bili_login_uid", "")
+        self._set_config_value("bili_login_uname", "")
+        self._set_config_value("bili_login_saved_at", 0)
+        if clear_manual_cookie:
+            self._set_config_value("bili_cookie", "")
+
+    async def _get_bili_account_status(
+        self,
+        cfg: WatchConfig,
+        *,
+        refresh: bool,
+    ) -> BiliLoginAccount:
+        if not cfg.bilibili_cookie:
+            return self._saved_or_default_account_status(cfg, message="no_cookie")
+
+        if (
+            not refresh
+            and self._account_status_cache is not None
+            and (time.time() - self._account_status_cache_ts) < 60
+        ):
+            return self._account_status_cache
+
+        if self._http is None:
+            return self._saved_or_default_account_status(cfg, message="http_client_unavailable")
+
+        try:
+            account = await self._http.get_login_account(cfg.bilibili_cookie)
+        except Exception as e:
+            return self._saved_or_default_account_status(
+                cfg,
+                message=f"status_probe_failed:{self._sanitize_error_message(e)}",
+            )
+
+        if account.is_logged_in and not account.uname and cfg.bili_login_uname:
+            account.uname = cfg.bili_login_uname
+        if account.is_logged_in and not account.uid and cfg.bili_login_uid:
+            account.uid = cfg.bili_login_uid
+        if not account.source:
+            account.source = cfg.bilibili_cookie_source
+        self._account_status_cache = account
+        self._account_status_cache_ts = time.time()
+        return account
+
+    def _saved_or_default_account_status(self, cfg: WatchConfig, *, message: str) -> BiliLoginAccount:
+        is_logged_in = bool(cfg.bili_login_cookie and cfg.bilibili_cookie_source == "login")
+        return BiliLoginAccount(
+            is_logged_in=is_logged_in,
+            uid=cfg.bili_login_uid,
+            uname=cfg.bili_login_uname,
+            source=cfg.bilibili_cookie_source,
+            message=message,
+        )
+
+    def _format_login_runtime_status(self) -> str:
+        state = self._login_runtime
+        if not state.qrcode_key:
+            return "idle"
+        seconds_left = max(0, int(state.expires_at - time.time())) if state.expires_at > 0 else 0
+        return (
+            f"status={state.status} message={state.message or '-'} "
+            f"expires_in={seconds_left}s url={'set' if state.url else 'empty'} "
+            f"image={'set' if state.image_path else 'empty'}"
+        )
+
+    def _format_account_status(self, account: BiliLoginAccount) -> str:
+        if not account.is_logged_in:
+            return f"logged_in=False source={account.source or 'none'} reason={account.message or 'not_logged_in'}"
+        return (
+            "logged_in=True "
+            f"source={account.source or 'unknown'} "
+            f"uid={self._mask_uid(account.uid)} "
+            f"uname={self._mask_text(account.uname)}"
+        )
+
+    def _format_channel_send_state(self, state: ChannelSendState) -> str:
+        last_attempt = self._format_timestamp(state.last_attempt_ts)
+        last_success = self._format_timestamp(state.last_success_ts)
+        ok_text = "never" if state.ok is None else str(bool(state.ok))
+        error_text = state.error or "-"
+        preview = state.text_preview or "-"
+        return (
+            f"enabled={state.enabled} ok={ok_text} "
+            f"last_attempt={last_attempt} last_success={last_success} "
+            f"summary={state.summary or '-'} error={error_text} preview={preview}"
+        )
+
+    def _format_timestamp(self, raw_ts: float) -> str:
+        if raw_ts <= 0:
+            return "never"
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(raw_ts))
+
+    def _mask_reply_preview(self, text: str) -> str:
+        normalized = self._normalize_reply(text, 30)
+        return normalized or "-"
+
+    def _mask_qrcode_key(self, value: str) -> str:
+        text = str(value or "").strip()
+        if len(text) <= 8:
+            return "*" * len(text)
+        return f"{text[:4]}...{text[-4:]}"
+
+    def _mask_uid(self, uid: str) -> str:
+        text = str(uid or "").strip()
+        if len(text) <= 4:
+            return text or "-"
+        return f"{text[:2]}***{text[-2:]}"
+
+    def _mask_text(self, value: str) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return "-"
+        if len(text) <= 2:
+            return text[0] + "*"
+        return f"{text[0]}***{text[-1]}"
+
+    def _sanitize_error_message(self, err: Exception | str) -> str:
+        text = str(err or "").strip().replace("\r", " ").replace("\n", " ")
+        if not text:
+            return "unknown_error"
+        text = re.sub(r"(SESSDATA|bili_jct|DedeUserID|DedeUserID__ckMd5)=([^;\\s]+)", r"\1=<hidden>", text)
+        if len(text) > 160:
+            text = text[:160].rstrip()
+        return text
+
+    def _build_login_qrcode_image(self, url: str) -> str:
+        if qrcode is None:
+            logger.warning("[bili_watcher] qrcode dependency unavailable, skip QR image rendering")
+            return ""
+        text = str(url or "").strip()
+        if not text:
+            return ""
+        try:
+            image = qrcode.make(text)
+            with tempfile.NamedTemporaryFile(
+                prefix="biliwatch-login-",
+                suffix=".png",
+                dir="/tmp",
+                delete=False,
+            ) as handle:
+                image.save(handle.name)
+                return handle.name
+        except Exception as e:
+            logger.warning("[bili_watcher] build login qrcode image failed: %s", e)
+            return ""
+
+    def _cleanup_login_qrcode_image(self) -> None:
+        path = str(getattr(self._login_runtime, "image_path", "") or "").strip()
+        if not path:
+            return
+        try:
+            Path(path).unlink(missing_ok=True)
+        except Exception as e:
+            logger.warning("[bili_watcher] cleanup login qrcode image failed: %s", e)
+
+    def _resolve_effective_bili_cookie(
+        self,
+        *,
+        manual_cookie: str,
+        login_cookie: str,
+    ) -> tuple[str, str]:
+        if manual_cookie:
+            return manual_cookie, "config"
+        if login_cookie:
+            return login_cookie, "login"
+        return "", "none"
+
     def _load_config(self) -> WatchConfig:
         reply_interval_seconds = self._to_int(
             self.config.get("reply_interval_seconds",15),
@@ -1424,12 +2061,12 @@ class BilibiliLiveWatcherPlugin(Star):
             1,
         )
         danmaku_trigger_threshold = self._to_int(
-            self.config.get("danmaku_trigger_threshold", 10),
+            self.config.get("danmaku_trigger_threshold", 20),
             20,
-            1,
+            0,
         )
         asr_trigger_threshold = self._to_int(
-            self.config.get("asr_trigger_threshold", 10),
+            self.config.get("asr_trigger_threshold", 1),
             1,
             0,
         )
@@ -1446,19 +2083,15 @@ class BilibiliLiveWatcherPlugin(Star):
         cookie = str(
             self.config.get("bili_cookie", self.config.get("bilibili_cookie", "")) or ""
         ).strip()
-        cookie_file = str(
-            self.config.get(
-                "bili_cookie_file",
-                self.config.get("bilibili_cookie_file", DEFAULT_COOKIE_FILE),
-            )
-            or DEFAULT_COOKIE_FILE
-        ).strip()
-        auto_load_cookie = self._to_bool(
-            self.config.get("auto_load_cookie_from_file", True),
-            True,
+        login_cookie = str(self.config.get("bili_login_cookie", "") or "").strip()
+        login_uid = str(self.config.get("bili_login_uid", "") or "").strip()
+        login_uname = str(self.config.get("bili_login_uname", "") or "").strip()
+        login_refresh_token = str(self.config.get("bili_login_refresh_token", "") or "").strip()
+        login_saved_at = self._to_int(self.config.get("bili_login_saved_at", 0), 0, 0)
+        cookie, cookie_source = self._resolve_effective_bili_cookie(
+            manual_cookie=cookie,
+            login_cookie=login_cookie,
         )
-        if not cookie and auto_load_cookie:
-            cookie = self._load_cookie_from_file(cookie_file)
 
         return WatchConfig(
             enabled=self._to_bool(self.config.get("enabled", True), True),
@@ -1474,24 +2107,26 @@ class BilibiliLiveWatcherPlugin(Star):
             target_id=str(self.config.get("target_id", "") or "").strip(),
             max_reply_chars=self._to_int(self.config.get("max_reply_chars", 60), 60, 10),
             bilibili_cookie=cookie,
-            bilibili_cookie_file=cookie_file,
-            auto_load_cookie_from_file=auto_load_cookie,
-            pipeline_mode=self._normalize_pipeline_mode(self.config.get("pipeline_mode", "danmu_only")),
-            use_realtime_danmaku_ws=self._to_bool(self.config.get("use_realtime_danmaku_ws", True), True),
-            danmu_ws_auth_mode=str(self.config.get("danmu_ws_auth_mode", "signed_wbi") or "signed_wbi").strip(),
-            allow_buvid3_only=self._to_bool(self.config.get("allow_buvid3_only", True), True),
-            wbi_sign_enabled=self._to_bool(self.config.get("wbi_sign_enabled", True), True),
-            audio_enabled=self._to_bool(self.config.get("audio_enabled", True), True),
+            bilibili_cookie_source=cookie_source,
+            sync_to_bilibili_live=self._to_bool(
+                self.config.get("sync_to_bilibili_live", False),
+                False,
+            ),
+            bili_login_cookie=login_cookie,
+            bili_login_uid=login_uid,
+            bili_login_uname=login_uname,
+            bili_login_refresh_token=login_refresh_token,
+            bili_login_saved_at=login_saved_at,
+            pipeline_mode=self._normalize_pipeline_mode(self.config.get("pipeline_mode", 2)),
+            use_realtime_danmaku_ws=INTERNAL_USE_REALTIME_DANMAKU_WS,
+            danmu_ws_auth_mode=INTERNAL_DANMU_WS_AUTH_MODE,
+            allow_buvid3_only=INTERNAL_ALLOW_BUVID3_ONLY,
+            wbi_sign_enabled=INTERNAL_WBI_SIGN_ENABLED,
             audio_pull_protocol=str(
                 self.config.get("audio_pull_protocol", "http_flv") or "http_flv"
             ).strip(),
-            audio_pull_api_preference=str(
-                self.config.get("audio_pull_api_preference", "getRoomPlayInfo") or "getRoomPlayInfo"
-            ).strip(),
-            audio_http_headers_enabled=self._to_bool(
-                self.config.get("audio_http_headers_enabled", True),
-                True,
-            ),
+            audio_pull_api_preference=INTERNAL_AUDIO_PULL_API_PREFERENCE,
+            audio_http_headers_enabled=INTERNAL_AUDIO_HTTP_HEADERS_ENABLED,
             ffmpeg_path=str(self.config.get("ffmpeg_path", "ffmpeg") or "ffmpeg").strip(),
             audio_sample_rate=self._to_int(self.config.get("audio_sample_rate", 16000), 16000, 8000),
             asr_backend=str(self.config.get("asr_backend", "sherpa_onnx_rknn") or "sherpa_onnx_rknn").strip(),
@@ -1525,14 +2160,8 @@ class BilibiliLiveWatcherPlugin(Star):
             asr_sense_voice_language=str(
                 self.config.get("asr_sense_voice_language", "auto") or "auto"
             ).strip(),
-            asr_sense_voice_use_itn=self._to_bool(
-                self.config.get("asr_sense_voice_use_itn", True),
-                True,
-            ),
-            asr_runtime_probe_required=self._to_bool(
-                self.config.get("asr_runtime_probe_required", True),
-                True,
-            ),
+            asr_sense_voice_use_itn=INTERNAL_ASR_SENSE_VOICE_USE_ITN,
+            asr_runtime_probe_required=INTERNAL_ASR_RUNTIME_PROBE_REQUIRED,
             asr_threads=self._to_int(self.config.get("asr_threads", 1), 1, -4),
             asr_vad_enabled=self._to_bool(self.config.get("asr_vad_enabled", False), False),
             asr_sentence_pause_seconds=self._to_float(
@@ -1545,19 +2174,16 @@ class BilibiliLiveWatcherPlugin(Star):
                 1,
             ),
             singer_mode_enabled=self._to_bool(self.config.get("singer_mode_enabled", True), True),
-            singer_mode_threshold=self._to_float(self.config.get("singer_mode_threshold", 0.3), 0.3),
+            singer_mode_keywords=self._to_string_list(
+                self.config.get("singer_mode_keywords", list(DEFAULT_SINGER_KEYWORDS)),
+                list(DEFAULT_SINGER_KEYWORDS),
+            ),
+            singer_mode_window_seconds=self._to_int(
+                self.config.get("singer_mode_window_seconds", 20),
+                20,
+                0,
+            ),
         )
-
-    def _load_cookie_from_file(self, cookie_file: str) -> str:
-        path = Path(cookie_file).expanduser()
-        if not path.exists():
-            return ""
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-            return str(data.get("cookie", "") or "").strip()
-        except Exception as e:
-            logger.warning(f"[bili_watcher] load cookie file failed: {e}")
-            return ""
 
     def _to_int(self, value: object, default: int, min_value: int) -> int:
         try:
@@ -1585,6 +2211,27 @@ class BilibiliLiveWatcherPlugin(Star):
                 return False
         return default
 
+    def _to_string_list(self, value: object, default: list[str]) -> list[str]:
+        raw_items: list[object]
+        if isinstance(value, list):
+            raw_items = value
+        elif isinstance(value, tuple):
+            raw_items = list(value)
+        elif isinstance(value, str):
+            raw_items = [part.strip() for part in value.split(",")]
+        else:
+            raw_items = list(default)
+
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        for item in raw_items:
+            text = str(item or "").strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            cleaned.append(text)
+        return cleaned or list(default)
+
     def _log_warn_throttled(self, msg: str, interval_seconds: int = 60):
         now = time.time()
         if now - self._last_warn_ts >= interval_seconds:
@@ -1597,7 +2244,21 @@ class BilibiliLiveWatcherPlugin(Star):
         except Exception:
             pass
 
+    def _drop_hidden_legacy_config_keys(self):
+        for key in HIDDEN_LEGACY_CONFIG_KEYS:
+            try:
+                if hasattr(self.config, "pop"):
+                    self.config.pop(key, None)
+                    continue
+            except Exception:
+                pass
+            try:
+                del self.config[key]
+            except Exception:
+                pass
+
     def _save_config_if_possible(self) -> bool:
+        self._drop_hidden_legacy_config_keys()
         if hasattr(self.config, "save_config"):
             try:
                 self.config.save_config()

@@ -1,126 +1,231 @@
 # astrbot_plugin_bilibililive_watcher
 
-定时监听 B 站直播间弹幕热度，并可融合直播语音 ASR；当触发条件满足时：
+定时监听 B 站直播间弹幕与直播语音，融合上下文后触发模型生成一条简短回复。发布版支持两条发送通道：
 
-1. 把这段时间内的弹幕与语音识别语句按时间顺序注入模型上下文；
-2. 使用当前会话的人设与模型生成一句简短弹幕风格文案；
-3. 主动发送到指定群聊/私聊。
+1. 发送到 AstrBot 绑定会话。
+2. 可选同步发送到 B 站直播弹幕。
 
-## 配置项
+默认升级行为保持不变：`sync_to_bilibili_live=false` 时，仍只发送到 AstrBot。
 
-在插件配置中填写（可用 JSON/YAML 对应字段）：
+## 当前能力
+
+- 稳定能力
+  - 直播间弹幕监听与去重
+  - 直播音频拉流 + ASR 融合
+  - 定时触发生成短回复
+  - 发送到 AstrBot 会话
+  - 手工 `bili_cookie` 回退
+  - RKNN 运行时探测与错误 wheel 诊断
+- 实验性能力
+  - B 站直播弹幕同步发送
+  - 插件内二维码登录
+- 配套SKILL
+  - bilibili_live_context_fetcher，用于约束模型何时将直播上下文注入自身聊天会话
+
+## 作者人工提示
+
+1. 我是在派上跑的，所以首先用的RKNN模型，不保证其他格式模型可以支持
+2. 推荐下载20-seconds-sense-voice类模型，不推荐也不支持实时（曾经试过实时，但是准确性、断句都很差）
+3. 使用`test_live_text_console.py [房间号] --asr`可以快速测试是否跑通
+
+## 安装与前置
+
+### AstrBot 自动安装的 Python 依赖
+
+插件根目录已提供 `requirements.txt`。AstrBot 安装插件时会按官方机制安装：
+
+- `aiohttp`
+- `sherpa-onnx`
+
+`requirements.txt` 已优先指向 sherpa-onnx 的 RKNN 发布来源，但最终是否拿到正确 RKNN wheel，仍以运行时探测结果为准。
+
+### 仍需用户自行准备的外部前置
+
+下列内容不会由插件自动安装：
+
+- `ffmpeg`
+  - 用于拉取直播音频。
+- ASR 模型文件
+  - 当前主支持 `.rknn` 模型。
+  - 默认模型目录：`./models/sherpa/rknn/...`
+  - 默认 VAD 模型：`./models/vad/silero_vad.onnx`
+- 如果使用RKNN
+  - 需要系统可提供 `librknnrt.so`。
+
+### RKNN 主支持路线
+
+发布版主支持：
+
+- RK3588
+- `sherpa-onnx` RKNN wheel
+- `.rknn` 模型
+
+CPU ONNX 仅作为回退路线，不作为首发主路线。
+
+## 快速配置
 
 ```yaml
 enabled: true
 debug: false
 
-# 直播间
 room_id: 27484357
-
-# 管线模式：仅弹幕 / 弹幕+ASR / 仅 ASR
-pipeline_mode: "danmu_plus_asr"
-
-# 触发节拍与上下文窗口
+pipeline_mode: 2
 reply_interval_seconds: 15
 context_window_seconds: 45
 danmaku_trigger_threshold: 20
 asr_trigger_threshold: 2
 
-# 发送目标（二选一）
-# 方式1：直接给完整 UMO（推荐）
+# AstrBot 发送目标
 # target_umo: "aiocqhttp:GroupMessage:123456789"
-
-# 方式2：分字段拼接
 target_platform_id: "default"
-target_type: "group" # group / private
+target_type: "group"
 target_id: "123456789"
 
 max_reply_chars: 60
 
-# B站 cookie（防风控）
+# B站 cookie 回退
 bili_cookie: ""
-auto_load_cookie_from_file: true
-bili_cookie_file: "~/.bilibili-cookie.json"
+bili_login_cookie: ""
 
-# 实时弹幕
-use_realtime_danmaku_ws: true
-danmu_ws_auth_mode: "signed_wbi"
-allow_buvid3_only: true
-wbi_sign_enabled: true
+# 新增：是否同步发送到 B 站直播弹幕
+sync_to_bilibili_live: false
 
-# 音频 / ASR
-audio_enabled: true
 audio_pull_protocol: "http_flv"
-audio_pull_api_preference: "getRoomPlayInfo"
-audio_http_headers_enabled: true
 ffmpeg_path: "ffmpeg"
 audio_sample_rate: 16000
+
 asr_backend: "sherpa_onnx_rknn"
-asr_strategy: "sensevoice_vad_offline" # 或 "streaming_zipformer" 回退
+asr_strategy: "sensevoice_vad_offline"
 asr_model_dir: "./models/sherpa/rknn/sherpa-onnx-rk3588-20-seconds-sense-voice-zh-en-ja-ko-yue-2024-07-17"
 asr_vad_model_path: "./models/vad/silero_vad.onnx"
-asr_vad_threshold: 0.3
-asr_vad_min_silence_duration: 0.35
-asr_vad_min_speech_duration: 0.25
-asr_vad_max_speech_duration: 20.0
-asr_sense_voice_language: "auto"
-asr_sense_voice_use_itn: true
-asr_runtime_probe_required: true
 asr_threads: 1
-asr_vad_enabled: false # 旧 streaming_zipformer 兼容字段
-# 下列断句参数仅保留给旧 streaming_zipformer 回退链路
-asr_sentence_pause_seconds: 0.8
-asr_sentence_min_chars: 2
 
-# 融合
 singer_mode_enabled: true
-singer_mode_threshold: 0.3
+singer_mode_keywords: ["好听", "打call", "天籁之音", "/\\"]
+singer_mode_window_seconds: 20
 ```
 
-### 关键语义
+以下行为已改为插件内部默认开启，不再建议手工配置：
 
-- `reply_interval_seconds`：统一循环时间；每到这个时间点，插件检查一次是否满足触发条件
-- `debug`：是否打印调试日志；开启后会输出实时弹幕、ASR 结果和最终 prompt
-- `context_window_seconds`：保留最近多少秒的弹幕/ASR 历史作为上下文
-- `danmaku_trigger_threshold`：累计弹幕条数阈值
-- `asr_trigger_threshold`：累计 ASR 语句条数阈值
-- `audio_pull_protocol`：音频流协议，可用 `http_flv` / `hls`
-- `asr_strategy`：当前默认主链路为 `sensevoice_vad_offline`，可回退到 `streaming_zipformer`
-- `asr_vad_model_path`：Silero VAD 模型文件，按插件目录相对路径解析
-- `asr_vad_threshold` / `asr_vad_min_*` / `asr_vad_max_*`：控制 VAD 切段灵敏度、最短静音和最长单句
-- `asr_sense_voice_language` / `asr_sense_voice_use_itn`：控制 SenseVoice 语言参数和 ITN
-- `asr_sentence_pause_seconds`：ASR 停顿多久后，认为上一句结束
-- `asr_sentence_min_chars`：避免过短碎句被单独算作一句
-- `pipeline_mode=danmu_plus_asr` 时，需要**弹幕和 ASR 同时达标**才触发回复
-- `pipeline_mode=asr_only` 时，只根据 ASR 阈值触发回复，不再要求弹幕条数达标
-- 触发后只清空“待触发累计”，不会立刻清空上下文历史
-- 若未显式配置 `context_window_seconds`，代码会兼容回退为 `reply_interval_seconds * 3`
-- prompt 开头会给出主播昵称和直播间标题
-- prompt 中会带 `ordered_context`，其中：
-  - `source` 为中文 `"弹幕"` / `"主播"`
-  - 按时间顺序排列，但不再把排序辅助时间字段直接暴露给模型
-- 实时链路只记录真正的直播弹幕（`DANMU_MSG`）和 ASR 语句，不再把点赞/礼物/进房事件混入“弹幕上下文”
-- 首次 history 轮询只用于建立去重基线，避免插件启动时把很早之前的旧弹幕误算进来
-- 当 WS 已连上但暂时没有收到实时弹幕时，插件仍会继续轮询 history 作为兜底，避免“首轮后不再读弹幕”
-- 新默认 ASR 路径是 `VAD 分段 + non-streaming SenseVoice`，更偏向长时间稳定的句段识别
-- `streaming_zipformer` 旧链路仍保留，便于灰度切换和现场回退
+- 实时弹幕优先使用 WebSocket，鉴权固定走 `signed_wbi`
+- WebSocket 鉴权优先仅携带 `buvid3`，并启用 WBI 签名
+- 音频拉流 API 固定优先 `getRoomPlayInfo`
+- `ffmpeg` 拉流默认注入 `Referer/Origin/User-Agent/Cookie`
+- SenseVoice 默认启用 ITN
+- ASR 默认要求先通过运行时探测再启用
 
-## Cookie 说明
+`pipeline_mode` 现改为整型配置：`0=danmu_only`、`1=asr_only`、`2=danmu_plus_asr`；非法值会回退为 `0`。
 
-- 默认会尝试读取 `~/.bilibili-cookie.json`，格式兼容 `bilibili-danmu_sender`：
-  `{"cookie": "...", "timestamp": 1234567890}`
-- 也可以直接配置 `bili_cookie` 字符串（仍兼容旧字段 `bilibili_cookie`）。
+`singer_mode` 现改为规则型配置：只要最近 `singer_mode_window_seconds` 秒内的弹幕命中 `singer_mode_keywords` 任一关键词，就视为唱歌场景。
+
+二维码登录成功后的 cookie / uid / uname / refresh_token 等字段仍会作为插件内部状态持久化。其中 `bili_login_cookie` 会继续暴露，便于你把它复制到 `bili_cookie` 做备份；其余登录内部字段不建议手工维护。
+
+生成 prompt 时，插件会额外告诉模型当前自己在 B 站使用的昵称，用来识别 `ordered_context` 里哪些弹幕是自己之前发过的，避免连续复读。
 
 ## 指令
 
-- `/biliwatch`：查看指令列表。
-- `/biliwatch status`：查看当前插件运行状态和关键配置。
-- `/biliwatch toggle [on|off]`：快速开关插件功能。
-- `/biliwatch room <room_id>`：设置监听直播间号。
-- `/biliwatch bind`：将发送目标绑定到当前会话（执行该指令的群/私聊）。
+- `/biliwatch help`
+- `/biliwatch status`
+- `/biliwatch toggle [on|off]`
+- `/biliwatch room <room_id>`
+- `/biliwatch bind`
+- `/biliwatch sync-live [on|off]`
+- `/biliwatch login`
+- `/biliwatch login status`
+- `/biliwatch logout`
 
-## 路由排查
+### 二维码登录说明
 
-- 如果日志出现 `cannot find platform for session ...`，说明会话前缀平台 ID 不匹配。
-- 当前版本会自动从 AstrBot 已加载平台实例中发现可用 ID（常见是 `default`）并自动修正。
-- 你也可以直接把 `target_umo` 设成当前聊天事件里的 `event.unified_msg_origin` 同格式值。
+- `/biliwatch login` 会发起官方 Web 二维码登录轮询。
+- 插件会优先尝试直接发送二维码图片；如果当前环境缺少二维码依赖或平台不支持图片发送，会回退到登录 URL。
+- 该能力标记为实验性；若 B 站链路不稳定，请直接回退到 `bili_cookie`。
+- `/biliwatch logout` 只清除插件内保存的登录态；如果你另外配置了 `bili_cookie`，回退凭据仍可能继续生效。
+
+## 状态输出
+
+`/biliwatch status` 现在会额外展示：
+
+- `bili_cookie_source`
+  - `config` / `login` / `none`
+- `bili_live_sync_enabled`
+- `bili_login_status`
+  - 是否已登录、账号脱敏信息、来源与失败摘要
+- `bili_login_runtime`
+  - 当前二维码登录轮询状态
+- `astrbot_send`
+- `bili_live_send`
+  - 最近一次发送是否成功、失败摘要、最近时间与消息预览
+
+## 关键语义
+
+- `sync_to_bilibili_live=false`
+  - 保持旧行为，只发 AstrBot。
+- `sync_to_bilibili_live=true`
+  - 同一次触发中，会同时尝试 AstrBot 和 B 站直播弹幕两个通道。
+  - 任一通道失败不会阻断另一通道。
+- Cookie 优先级
+  - `bili_cookie`
+  - `bili_login_cookie`
+
+## 故障排查
+
+### 1. `asr` 状态显示 wheel 不含 RKNN 支持
+
+常见表现：
+
+- `disabled(strategy=..., reason=current sherpa_onnx wheel has no RKNN support...)`
+
+说明：
+
+- 当前自动安装到的 `sherpa-onnx` 不是 RKNN wheel。
+- 这不是“插件已安装好但 ASR 自然不可用”的正常状态，需要更换为正确的 RKNN wheel。
+
+### 2. B 站同步发送失败
+
+先看 `/biliwatch status` 中的：
+
+- `bili_cookie_source`
+- `bili_login_status`
+- `bili_live_send`
+
+常见原因：
+
+- 未登录
+- cookie 失效
+- cookie 中缺少 `bili_jct`
+- B 站接口风控或返回错误码
+
+这类失败不会阻断 AstrBot 侧发送。
+
+### 3. 二维码登录失败或超时
+
+二维码登录是实验性能力。若出现：
+
+- 一直停留在 `waiting_scan` / `waiting_confirm`
+- `expired`
+- `error`
+
+请直接回退到：
+
+- `bili_cookie`
+
+### 4. 音频不可用
+
+检查：
+
+- `ffmpeg` 是否可执行
+- 直播间是否正在开播
+- 模型目录是否存在
+- `silero_vad.onnx` 是否存在
+
+## 升级说明
+
+- 旧配置可以直接沿用。
+- 不开启 `sync_to_bilibili_live` 时，现有发送行为不变。
+- 现有 `bili_cookie` 手工回退链路保留。
+- `pipeline_mode` 现以 `0/1/2` 配置；旧字符串写法仍可兼容读取，但新非法值会回退到 `0(danmu_only)`。
+- `danmaku_trigger_threshold` 允许为 `0`，不再强制抬到 `1`。
+- `audio_enabled` 已废弃；进入 `asr_only` 或 `danmu_plus_asr` 时会自动拉音频。
+- `singer_mode_threshold` 已废弃；Singer Mode 现改为“关键词数组 + 时间窗口”命中规则。
+- 旧版中 `use_realtime_danmaku_ws`、`danmu_ws_auth_mode`、`allow_buvid3_only`、`wbi_sign_enabled`、`audio_pull_api_preference`、`audio_http_headers_enabled`、`asr_sense_voice_use_itn`、`asr_runtime_probe_required` 已改为内部默认值；即使旧配置中保留这些键，也不会再影响运行。
+- 旧版中的 `bili_cookie_file`、`bilibili_cookie_file`、`auto_load_cookie_from_file` 已废弃；保存配置时会被自动清理。
