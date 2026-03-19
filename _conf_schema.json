@@ -1,177 +1,262 @@
 {
-  "enabled": {
-    "description": "是否启用 B 站弹幕监听任务",
-    "type": "bool",
-    "default": true
+  "global":{
+    "type": "object",
+    "description": "全局配置",
+    "hint": "插件的全局开关性配置",
+    "items": {
+      "enabled": {
+        "description": "是否启用 B 站弹幕监听任务",
+        "type": "bool",
+        "default": true,
+        "hint": "关闭后插件不再轮询直播间，也不会生成或发送弹幕"
+      },
+      "debug": {
+        "description": "调试开关：开启后打印弹幕、ASR 结果和最终 prompt",
+        "type": "bool",
+        "default": false,
+        "hint": "排查问题时再开启，正常使用建议关闭，避免日志过多"
+      },
+      "room_id": {
+        "description": "B 站直播间号（短号或房间号均可）",
+        "type": "int",
+        "default": 0,
+        "hint": "填主播直播间短号或真实房间号都可以；推荐配合 /biliwatch room 命令设置"
+      },
+      "pipeline_mode": {
+        "description": "管线模式：0仅弹幕；1仅语音；2合并；非法值默认 0",
+        "type": "int",
+        "default": 2,
+        "hint": "一般保持 2 即可；1 会只看主播语音，0 会只看观众弹幕"
+      },
+      "sync_to_bilibili_live": {
+        "description": "是否在发送到 AstrBot 会话的同时，同步发送到 B 站直播弹幕；默认关闭",
+        "type": "bool",
+        "default": false,
+        "hint": "开启后会把生成结果真正发到直播间；测试阶段建议先关闭"
+      }
+    }
   },
-  "debug": {
-    "description": "调试开关：开启后打印弹幕、ASR 结果和最终 prompt",
-    "type": "bool",
-    "default": false
+  "main_loop": {
+    "type": "object",
+    "description": "主循环与触发条件",
+    "hint": "控制轮询周期、上下文窗口和触发阈值",
+    "items": {
+      "reply_interval_seconds": {
+        "description": "统一循环时间（秒）：同时用于主循环检查与 history 轮询",
+        "type": "int",
+        "default": 30,
+        "hint": "越小越及时，但请求更频繁；通常 10 到 20 秒比较合适"
+      },
+      "context_window_seconds": {
+        "description": "上下文保留窗口（秒）：控制参与融合与 prompt 的最近弹幕/ASR 历史范围",
+        "type": "int",
+        "default": 300,
+        "hint": "窗口越大，参考信息越多，但也更容易把旧话题带进来。如果仅用于会话中注入直播内容，可以根据模型上下文窗口开很大"
+      },
+      "danmaku_trigger_threshold": {
+        "description": "累计弹幕条数达到该阈值后，才允许触发回复",
+        "type": "int",
+        "default": 10,
+        "hint": "允许设置为 0；设得越小越积极，设得越大越克制"
+      },
+      "asr_trigger_threshold": {
+        "description": "累计 ASR 语句条数达到该阈值后，才允许触发回复（danmu_plus_asr / asr_only 模式）",
+        "type": "int",
+        "default": 10,
+        "hint": "只在启用 ASR 的模式下生效；主播刚开口就想触发可保持 1"
+      }
+    }
   },
-  "room_id": {
-    "description": "B 站直播间号（短号或房间号均可）",
-    "type": "int",
-    "default": 0
+  "sender": {
+    "type": "object",
+    "description": "生成弹幕时，会发送给哪个会话",
+    "hint": "一般用于实现一起看直播，或用于调试，推荐使用/biliwatch bind一键绑定",
+    "items": {
+      "target_umo": {
+        "description": "直接指定消息目标 UMO（例如 aiocqhttp:GroupMessage:123456789）",
+        "type": "string",
+        "default": "",
+        "hint": "如果你已经知道完整 UMO，可以直接填；否则更推荐用 /biliwatch bind 自动绑定"
+      },
+      "target_platform_id": {
+        "description": "目标平台适配器 ID（当 target_umo 为空时使用）",
+        "type": "string",
+        "default": "default",
+        "hint": "仅在不直接填写 target_umo 时使用"
+      },
+      "target_type": {
+        "description": "目标会话类型（group/private）",
+        "type": "string",
+        "default": "group",
+        "hint": "通常是 group；如果要发给私聊，再改成 private"
+      },
+      "target_id": {
+        "description": "目标群号或私聊号（当 target_umo 为空时使用）",
+        "type": "string",
+        "default": "",
+        "hint": "和 target_platform_id、target_type 组合使用；推荐优先用 /biliwatch bind 自动写入"
+      }
+    }
   },
-  "pipeline_mode": {
-    "description": "管线模式：0仅弹幕；1仅语音；2合并；非法值默认 0",
-    "type": "int",
-    "default": 2
+  "generation": {
+    "type": "object",
+    "description": "弹幕生成相关参数",
+    "hint": "配置生成弹幕生成的字符数、prompt等",
+    "items": {
+      "provider_id": {
+        "description": "独立指定用于生成弹幕的模型提供商 ID；为空时跟随当前会话",
+        "type": "string",
+        "default": "",
+        "_special": "select_provider",
+        "hint": "指定用于执行生产弹幕的 LLM 提供商 ID。留空则使用当前会话的提供商。推荐使用人设扮演能力和指令跟随能力较强的模型"
+      },
+      "persona_id": {
+        "description": "独立指定用于生成弹幕的人设名称",
+        "type": "string",
+        "default": "", 
+        "hint": "用于生成弹幕的人格名称，会将人格的设定和skill补充到系统提示词中，为空时跟随当前会话"
+      },
+      "prompt_template": {
+        "description": "自定义生成 prompt 模板，为空使用内置",
+        "hint": "使用双层花括号内嵌变量：{{anchor_name}}（主播名称）、{{room_title}}（直播间标题）、{{reply_length_limit}}（生成字符数限制）、{{context_json}}（上下文信息的 JSON 字符串）等。留空则使用默认模板。建议在模板中明确要求生成适合直播弹幕风格的内容，并合理利用上下文变量。",
+        "type": "string",
+        "default": "下面是 B 站直播间中的主播语音转写与观众弹幕信息。\n主播昵称：{{anchor_name}}\n直播间标题：{{room_title}}\n直播间房间号：{{room_id}}\n你当前在 B 站直播间使用的昵称：{{self_bili_nickname}}\n请基于这些信息，按照你当前的人设，生成 1 条适合发送到直播间的互动弹幕。\n输出要求：\n1) 只输出一句话，不要解释，不要 Markdown。\n2) 长度不超过 {{reply_length_limit}} 字，口语自然。\n3) 不要过分强调人设，不要攻击性，模仿已有弹幕风格。\n4) 优先参考 ordered_context 中按时间排序后的事件序列，理解弹幕与语音内容的先后关系，越近的越优先。\n5) 如果 ordered_context 中某条弹幕的 speaker 与你当前 B 站昵称相同，那就是你自己之前发过的弹幕；不要把它作为风格参考。\n{{singer_mode_instruction}}\n\nordered_context:\n{{context_json}}"
+      },
+      "max_reply_chars": {
+        "description": "模型生成内容最大字符数",
+        "type": "int",
+        "default": 30,
+        "hint": "实际下发给模型的字符上限会取 max(10, 该值)"
+      }
+    }
   },
-  "reply_interval_seconds": {
-    "description": "统一循环时间（秒）：同时用于主循环检查与 history 轮询",
-    "type": "int",
-    "default": 15
+  "user_auth": {
+    "type": "object",
+    "description": "b站登录验证",
+    "hint": "在 B站Cookie 字符串为空时，第一次登录会自动填入，防止因重置插件导致登录状态丢失",
+    "items": {
+      "bili_cookie": {
+        "description": "B 站 Cookie 字符串",
+        "type": "string",
+        "default": "",
+        "hint": "手工保底凭据；如果这里为空，插件会优先尝试使用二维码登录后保存的 cookie"
+      },
+      "bili_login_cookie": {
+        "description": "插件内二维码登录成功后写入的可复制 Cookie 字符串；可手工复制到“B 站 Cookie 字符串”做备份",
+        "type": "string",
+        "default": "",
+        "hint": "通常不用手填；登录成功后会自动写入，也可复制出来备份"
+      }
+    }
   },
-  "context_window_seconds": {
-    "description": "上下文保留窗口（秒）：控制参与融合与 prompt 的最近弹幕/ASR 历史范围",
-    "type": "int",
-    "default": 45
+  "asr":{
+    "type": "object",
+    "description": "语音识别模型",
+    "hint": "配置语音识别ASR模型相关参数",
+    "items": {
+      "audio_pull_protocol": {
+        "description": "音频拉流协议：http_flv / hls",
+        "type": "string",
+        "default": "http_flv",
+        "hint": "通常优先保持 http_flv；只有遇到特殊直播间不稳定时再尝试 hls"
+      },
+      "ffmpeg_path": {
+        "description": "ffmpeg 可执行文件路径",
+        "type": "string",
+        "default": "ffmpeg",
+        "hint": "如果 ffmpeg 已经在 PATH 中，直接保持默认值即可"
+      },
+      "audio_sample_rate": {
+        "description": "ASR 音频采样率",
+        "type": "int",
+        "default": 16000,
+        "hint": "通常保持 16000；只有模型或设备明确要求时再调整"
+      },
+      "asr_backend": {
+        "description": "ASR 后端：保留 sherpa_onnx_rknn / sherpa_onnx_cpu_onnx 兼容字段",
+        "type": "string",
+        "default": "sherpa_onnx_rknn",
+        "hint": "RK3588 推荐 sherpa_onnx_rknn；没有 RKNN 时再退回 sherpa_onnx_cpu_onnx"
+      },
+      "asr_model_dir": {
+        "description": "sherpa ASR 模型目录；SenseVoice 默认应指向官方 sherpa-onnx RKNN release 目录",
+        "type": "string",
+        "default": "./models/sherpa/rknn/sherpa-onnx-rk3588-20-seconds-sense-voice-zh-en-ja-ko-yue-2024-07-17",
+        "hint": "相对路径会按插件目录解析；请指向包含模型文件的完整目录"
+      },
+      "asr_vad_model_path": {
+        "description": "Silero VAD ONNX 模型文件路径（相对插件目录解析）",
+        "type": "string",
+        "default": "./models/vad/silero_vad.onnx",
+        "hint": "通常无需改动；只有你换了自定义 VAD 模型时才需要修改"
+      },
+      "asr_vad_threshold": {
+        "description": "Silero VAD 触发阈值",
+        "type": "float",
+        "default": 0.3,
+        "hint": "越大越保守，越小越容易判定为语音"
+      },
+      "asr_vad_min_silence_duration": {
+        "description": "VAD 判定句段结束所需最小静音时长（秒）",
+        "type": "float",
+        "default": 0.35,
+        "hint": "适当调大可以减少碎句，调小则更灵敏"
+      },
+      "asr_vad_min_speech_duration": {
+        "description": "VAD 判定有效语音所需最小时长（秒）",
+        "type": "float",
+        "default": 0.25,
+        "hint": "过短的杂音不会被当成一句有效语音"
+      },
+      "asr_vad_max_speech_duration": {
+        "description": "VAD 单句最长时长（秒）；默认与 20-second SenseVoice 模型对齐",
+        "type": "float",
+        "default": 20.0,
+        "hint": "建议不要超过模型本身的有效时长上限"
+      },
+      "asr_sense_voice_language": {
+        "description": "SenseVoice 语言参数：auto / zh / en / ja / ko / yue",
+        "type": "string",
+        "default": "auto",
+        "hint": "多语言或不确定场景保持 auto；单语种直播可手工指定"
+      },
+      "asr_threads": {
+        "description": "ASR 线程 / RKNN NPU core mask（RKNN 推荐 1；兼容 0/-1/-2/-3/-4）",
+        "type": "int",
+        "default": 1,
+        "hint": "RKNN 一般保持 1；只有你明确知道硬件调度需求时再修改"
+      }
+    }
   },
-  "danmaku_trigger_threshold": {
-    "description": "累计弹幕条数达到该阈值后，才允许触发回复",
-    "type": "int",
-    "default": 20
-  },
-  "asr_trigger_threshold": {
-    "description": "累计 ASR 语句条数达到该阈值后，才允许触发回复（danmu_plus_asr / asr_only 模式）",
-    "type": "int",
-    "default": 1
-  },
-  "target_umo": {
-    "description": "直接指定消息目标 UMO（例如 aiocqhttp:GroupMessage:123456789）",
-    "type": "string",
-    "default": ""
-  },
-  "target_platform_id": {
-    "description": "目标平台适配器 ID（当 target_umo 为空时使用）",
-    "type": "string",
-    "default": "default"
-  },
-  "target_type": {
-    "description": "目标会话类型（group/private）",
-    "type": "string",
-    "default": "group"
-  },
-  "target_id": {
-    "description": "目标群号或私聊号（当 target_umo 为空时使用）",
-    "type": "string",
-    "default": ""
-  },
-  "max_reply_chars": {
-    "description": "模型生成内容最大字符数",
-    "type": "int",
-    "default": 30
-  },
-  "bili_cookie": {
-    "description": "B 站 Cookie 字符串",
-    "type": "string",
-    "default": ""
-  },
-  "bili_login_cookie": {
-    "description": "插件内二维码登录成功后写入的可复制 Cookie 字符串；可手工复制到“B 站 Cookie 字符串”做备份",
-    "type": "string",
-    "default": ""
-  },
-  "sync_to_bilibili_live": {
-    "description": "是否在发送到 AstrBot 会话的同时，同步发送到 B 站直播弹幕；默认关闭",
-    "type": "bool",
-    "default": false
-  },
-  "audio_pull_protocol": {
-    "description": "音频拉流协议：http_flv / hls",
-    "type": "string",
-    "default": "http_flv"
-  },
-  "ffmpeg_path": {
-    "description": "ffmpeg 可执行文件路径",
-    "type": "string",
-    "default": "ffmpeg"
-  },
-  "audio_sample_rate": {
-    "description": "ASR 音频采样率",
-    "type": "int",
-    "default": 16000
-  },
-  "asr_backend": {
-    "description": "ASR 后端：保留 sherpa_onnx_rknn / sherpa_onnx_cpu_onnx 兼容字段",
-    "type": "string",
-    "default": "sherpa_onnx_rknn"
-  },
-  "asr_strategy": {
-    "description": "ASR 策略：sensevoice_vad_offline / streaming_zipformer",
-    "type": "string",
-    "default": "sensevoice_vad_offline"
-  },
-  "asr_model_dir": {
-    "description": "sherpa ASR 模型目录；SenseVoice 默认应指向官方 sherpa-onnx RKNN release 目录",
-    "type": "string",
-    "default": "./models/sherpa/rknn/sherpa-onnx-rk3588-20-seconds-sense-voice-zh-en-ja-ko-yue-2024-07-17"
-  },
-  "asr_vad_model_path": {
-    "description": "Silero VAD ONNX 模型文件路径（相对插件目录解析）",
-    "type": "string",
-    "default": "./models/vad/silero_vad.onnx"
-  },
-  "asr_vad_threshold": {
-    "description": "Silero VAD 触发阈值",
-    "type": "float",
-    "default": 0.3
-  },
-  "asr_vad_min_silence_duration": {
-    "description": "VAD 判定句段结束所需最小静音时长（秒）",
-    "type": "float",
-    "default": 0.35
-  },
-  "asr_vad_min_speech_duration": {
-    "description": "VAD 判定有效语音所需最小时长（秒）",
-    "type": "float",
-    "default": 0.25
-  },
-  "asr_vad_max_speech_duration": {
-    "description": "VAD 单句最长时长（秒）；默认与 20-second SenseVoice 模型对齐",
-    "type": "float",
-    "default": 20.0
-  },
-  "asr_sense_voice_language": {
-    "description": "SenseVoice 语言参数：auto / zh / en / ja / ko / yue",
-    "type": "string",
-    "default": "auto"
-  },
-  "asr_threads": {
-    "description": "ASR 线程 / RKNN NPU core mask（RKNN 推荐 1；兼容 0/-1/-2/-3/-4）",
-    "type": "int",
-    "default": 1
-  },
-  "asr_vad_enabled": {
-    "description": "旧版兼容字段；streaming_zipformer 时仍透传，sensevoice_vad_offline 下实际固定使用 VAD",
-    "type": "bool",
-    "default": false
-  },
-  "asr_sentence_pause_seconds": {
-    "description": "旧 streaming_zipformer 断句参数：按停顿断句时的最小停顿秒数",
-    "type": "float",
-    "default": 0.75
-  },
-  "asr_sentence_min_chars": {
-    "description": "旧 streaming_zipformer 断句参数：允许输出的最小字符数",
-    "type": "int",
-    "default": 1
-  },
-  "singer_mode_enabled": {
-    "description": "是否启用 Singer Mode 判断",
-    "type": "bool",
-    "default": true
-  },
-  "singer_mode_keywords": {
-    "description": "Singer Mode 关键词数组；当最近窗口内弹幕包含任一关键词时，判定为唱歌场景",
-    "type": "list",
-    "default": ["好听", "打call", "天籁之音", "/\\"]
-  },
-  "singer_mode_window_seconds": {
-    "description": "Singer Mode 判定窗口（秒）；以最近弹幕为基准回看该时间内是否命中关键词",
-    "type": "int",
-    "default": 20
+  "singer":{
+    "type": "object",
+    "description": "唱歌检测设置",
+    "hint": "此功能用于根据弹幕检测主播是否正在唱歌，进而避免生成不合场合的弹幕",
+    "items": {
+      "singer_mode_enabled": {
+        "description": "是否启用 Singer Mode 判断",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后会根据最近弹幕命中情况识别唱歌场景"
+      },
+      "singer_mode_keywords": {
+        "description": "Singer Mode 关键词数组；当最近窗口内弹幕包含任一关键词时，判定为唱歌场景",
+        "type": "list",
+        "default": ["好听", "打call", "天籁之音", "/\\"],
+        "hint": "建议放直播间里常见的夸唱歌弹幕关键词；命中任意一个即可触发"
+      },
+      "singer_mode_window_seconds": {
+        "description": "Singer Mode 判定窗口（秒）；以最近弹幕为基准回看该时间内是否命中关键词",
+        "type": "int",
+        "default": 20,
+        "hint": "窗口越大越容易判定为唱歌场景，但也更容易拖尾"
+      },
+      "singer_mode_instruction": {
+        "description": "判定为唱歌场景后，额外插入到 prompt 中的约束说明",
+        "type": "string",
+        "default": "6) 当前是唱歌场景，可以参考弹幕发送“好听”或“打call”，严禁根据主播歌词回复。",
+        "hint": "支持在 prompt_template 中通过 {{singer_mode_instruction}} 引用；留空表示唱歌场景不额外补充说明"
+      }
+    }
   }
 }

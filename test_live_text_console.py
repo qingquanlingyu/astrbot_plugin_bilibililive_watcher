@@ -120,7 +120,6 @@ class LiveTextConsole:
             print(f"[{_ts()}] INFO asr disabled by default, pass --asr to enable")
             return
         self._asr_worker = build_asr_worker_or_none(
-            asr_strategy=self.args.asr_strategy,
             model_dir=self.args.asr_model_dir,
             sample_rate=self.args.audio_sample_rate,
             threads=self.args.asr_threads,
@@ -131,9 +130,6 @@ class LiveTextConsole:
             vad_max_speech_duration=self.args.asr_vad_max_speech_duration,
             sense_voice_language=self.args.asr_sense_voice_language,
             sense_voice_use_itn=self.args.asr_sense_voice_use_itn,
-            vad_enabled=self.args.asr_vad_enabled,
-            sentence_pause_seconds=self.args.asr_sentence_pause_seconds,
-            sentence_min_chars=self.args.asr_sentence_min_chars,
         )
         if self._asr_worker is None:
             print(
@@ -431,12 +427,6 @@ def parse_args() -> argparse.Namespace:
         help="周期性打印 PCM-HEARTBEAT 标记，便于观察源流是否持续到达；设为 0 关闭",
     )
     p.add_argument("--audio-sample-rate", type=int, default=16000, help="音频采样率")
-    p.add_argument(
-        "--asr-strategy",
-        choices=("sensevoice_vad_offline", "streaming_zipformer"),
-        default="sensevoice_vad_offline",
-        help="ASR 策略：默认优先使用 SenseVoice + VAD 离线句段识别",
-    )
     p.add_argument("--asr-model-dir", default=DEFAULT_ASR_MODEL_DIR, help="sherpa 模型目录")
     p.add_argument(
         "--asr-vad-model-path",
@@ -474,14 +464,6 @@ def parse_args() -> argparse.Namespace:
         help="SenseVoice 是否启用 ITN",
     )
     p.add_argument("--asr-threads", type=int, default=1, help="ASR线程数（RKNN 推荐 1）")
-    p.add_argument(
-        "--asr-vad-enabled",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="与插件一致；当前仅透传配置，默认关闭",
-    )
-    p.add_argument("--asr-sentence-pause-seconds", type=float, default=0.8, help="按停顿断句的最小停顿秒数")
-    p.add_argument("--asr-sentence-min-chars", type=int, default=2, help="ASR 最小句长")
     return p.parse_args()
 
 

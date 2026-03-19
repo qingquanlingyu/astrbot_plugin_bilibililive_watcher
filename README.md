@@ -70,6 +70,8 @@ debug: false
 
 room_id: 27484357
 pipeline_mode: 2
+
+# main_loop
 reply_interval_seconds: 15
 context_window_seconds: 45
 danmaku_trigger_threshold: 20
@@ -81,6 +83,10 @@ target_platform_id: "default"
 target_type: "group"
 target_id: "123456789"
 
+# generation
+provider_id: ""
+persona_id: ""
+prompt_template: "默认已内置标准直播弹幕生成模板"
 max_reply_chars: 60
 
 # B站 cookie 回退
@@ -95,7 +101,6 @@ ffmpeg_path: "ffmpeg"
 audio_sample_rate: 16000
 
 asr_backend: "sherpa_onnx_rknn"
-asr_strategy: "sensevoice_vad_offline"
 asr_model_dir: "./models/sherpa/rknn/sherpa-onnx-rk3588-20-seconds-sense-voice-zh-en-ja-ko-yue-2024-07-17"
 asr_vad_model_path: "./models/vad/silero_vad.onnx"
 asr_threads: 1
@@ -103,6 +108,7 @@ asr_threads: 1
 singer_mode_enabled: true
 singer_mode_keywords: ["好听", "打call", "天籁之音", "/\\"]
 singer_mode_window_seconds: 20
+singer_mode_instruction: "6) 当前是唱歌场景，可以参考弹幕发送“好听”或“打call”，严禁根据主播歌词回复。"
 ```
 
 以下行为已改为插件内部默认开启，不再建议手工配置：
@@ -113,14 +119,31 @@ singer_mode_window_seconds: 20
 - `ffmpeg` 拉流默认注入 `Referer/Origin/User-Agent/Cookie`
 - SenseVoice 默认启用 ITN
 - ASR 默认要求先通过运行时探测再启用
+- 旧 `streaming_zipformer` 已移除，ASR 固定为 SenseVoice + VAD 离线链路
 
 `pipeline_mode` 现改为整型配置：`0=danmu_only`、`1=asr_only`、`2=danmu_plus_asr`；非法值会回退为 `0`。
 
 `singer_mode` 现改为规则型配置：只要最近 `singer_mode_window_seconds` 秒内的弹幕命中 `singer_mode_keywords` 任一关键词，就视为唱歌场景。
 
-二维码登录成功后的 cookie / uid / uname / refresh_token 等字段仍会作为插件内部状态持久化。其中 `bili_login_cookie` 会继续暴露，便于你把它复制到 `bili_cookie` 做备份；其余登录内部字段不建议手工维护。
+二维码登录成功后的 cookie / uid / uname / refresh_token 等字段仍会作为插件内部状态持久化。其中 `bili_login_cookie` 会继续暴露，便于你把它复制到 `bili_cookie` 做备份；如果 `bili_cookie` 原本为空，首次登录成功后也会自动写入同一份 cookie，避免插件重置后丢失登录态；其余登录内部字段不建议手工维护。
 
 生成 prompt 时，插件会额外告诉模型当前自己在 B 站使用的昵称，用来识别 `ordered_context` 里哪些弹幕是自己之前发过的，避免连续复读。
+
+`generation` 现在支持独立配置生成链路：
+
+- `provider_id`
+  - 单独指定用于生成弹幕的模型提供商；为空时跟随当前会话。
+- `persona_id`
+  - 单独指定用于生成弹幕的人设；为空时跟随当前会话。
+- `prompt_template`
+  - 自定义 prompt 模板，默认就是插件当前内置模板；支持双层花括号变量。
+  - 常用变量：`{{anchor_name}}`、`{{room_title}}`、`{{room_id}}`、`{{self_bili_nickname}}`、`{{reply_length_limit}}`、`{{context_json}}`、`{{scene_mode}}`、`{{singer_mode_instruction}}`
+
+`singer` 配置现在额外支持：
+
+- `singer_mode_instruction`
+  - 仅在识别为唱歌场景时附加到 prompt 中。
+  - 可以在 `prompt_template` 里通过 `{{singer_mode_instruction}}` 引用；留空则不附加。
 
 ## 指令
 
@@ -227,5 +250,6 @@ singer_mode_window_seconds: 20
 - `danmaku_trigger_threshold` 允许为 `0`，不再强制抬到 `1`。
 - `audio_enabled` 已废弃；进入 `asr_only` 或 `danmu_plus_asr` 时会自动拉音频。
 - `singer_mode_threshold` 已废弃；Singer Mode 现改为“关键词数组 + 时间窗口”命中规则。
+- `streaming_zipformer` 已彻底移除；`asr_strategy`、`asr_vad_enabled`、`asr_sentence_pause_seconds`、`asr_sentence_min_chars` 已废弃并会在保存配置时清理。
 - 旧版中 `use_realtime_danmaku_ws`、`danmu_ws_auth_mode`、`allow_buvid3_only`、`wbi_sign_enabled`、`audio_pull_api_preference`、`audio_http_headers_enabled`、`asr_sense_voice_use_itn`、`asr_runtime_probe_required` 已改为内部默认值；即使旧配置中保留这些键，也不会再影响运行。
 - 旧版中的 `bili_cookie_file`、`bilibili_cookie_file`、`auto_load_cookie_from_file` 已废弃；保存配置时会被自动清理。

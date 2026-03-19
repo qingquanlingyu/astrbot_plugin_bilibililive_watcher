@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import re
 import tempfile
@@ -33,7 +34,11 @@ try:  # pragma: no cover
     from .bili_ws import DanmakuRealtimeClient
     from .fusion import DEFAULT_SINGER_KEYWORDS, FusionEngine
     from .models import ASRSegment, DanmakuItem
-    from .prompting import build_fused_prompt
+    from .prompting import (
+        DEFAULT_FUSED_PROMPT_TEMPLATE,
+        DEFAULT_SINGER_MODE_INSTRUCTION,
+        build_fused_prompt,
+    )
 except ImportError:  # pragma: no cover
     from asr_sherpa import SherpaASRWorker, build_asr_worker_or_none
     from audio_pipe import AudioCaptureWorker, AudioRequestOptions
@@ -48,7 +53,7 @@ except ImportError:  # pragma: no cover
     from bili_ws import DanmakuRealtimeClient
     from fusion import DEFAULT_SINGER_KEYWORDS, FusionEngine
     from models import ASRSegment, DanmakuItem
-    from prompting import build_fused_prompt
+    from prompting import DEFAULT_FUSED_PROMPT_TEMPLATE, DEFAULT_SINGER_MODE_INSTRUCTION, build_fused_prompt
 
 DEFAULT_ASR_MODEL_DIR = (
     "./models/sherpa/rknn/"
@@ -72,6 +77,10 @@ HIDDEN_LEGACY_CONFIG_KEYS = (
     "bilibili_cookie_file",
     "auto_load_cookie_from_file",
     "audio_enabled",
+    "asr_strategy",
+    "asr_vad_enabled",
+    "asr_sentence_pause_seconds",
+    "asr_sentence_min_chars",
     "singer_mode_threshold",
     "use_realtime_danmaku_ws",
     "danmu_ws_auth_mode",
@@ -98,6 +107,9 @@ class WatchConfig:
     target_platform_id: str
     target_type: str
     target_id: str
+    generation_provider_id: str
+    generation_persona_id: str
+    generation_prompt_template: str
     max_reply_chars: int
     bilibili_cookie: str
     bilibili_cookie_source: str
@@ -118,7 +130,6 @@ class WatchConfig:
     ffmpeg_path: str
     audio_sample_rate: int
     asr_backend: str
-    asr_strategy: str
     asr_model_dir: str
     asr_vad_model_path: str
     asr_vad_threshold: float
@@ -129,12 +140,10 @@ class WatchConfig:
     asr_sense_voice_use_itn: bool
     asr_runtime_probe_required: bool
     asr_threads: int
-    asr_vad_enabled: bool
-    asr_sentence_pause_seconds: float
-    asr_sentence_min_chars: int
     singer_mode_enabled: bool
     singer_mode_keywords: list[str]
     singer_mode_window_seconds: int
+    singer_mode_instruction: str
 
 
 @dataclass(slots=True)
@@ -281,6 +290,14 @@ class BilibiliLiveWatcherPlugin(Star):
                     f"debug: {cfg.debug}",
                     f"pipeline_mode: {cfg.pipeline_mode}",
                     f"room_id: {cfg.room_id}",
+                    f"generation_provider_id: {cfg.generation_provider_id or '(default)'}",
+                    f"generation_persona_id: {cfg.generation_persona_id or '(default)'}",
+                    (
+                        "generation_prompt_template: default"
+                        if cfg.generation_prompt_template.strip() == DEFAULT_FUSED_PROMPT_TEMPLATE.strip()
+                        or not cfg.generation_prompt_template.strip()
+                        else "generation_prompt_template: set"
+                    ),
                     f"target: {target_umo or '(未配置)'}",
                     f"platform_ids: {platform_ids or '[]'}",
                     f"bili_cookie_source: {cfg.bilibili_cookie_source}",
@@ -321,7 +338,7 @@ class BilibiliLiveWatcherPlugin(Star):
             yield event.plain_result("room_id 无效，请输入正整数。例如：/biliwatch room 22642754")
             return
 
-        self._set_config_value("room_id", room_id_int)
+        self._set_config_value("global.room_id", room_id_int)
         self._real_room_id = None
         self._real_room_id_source = None
         self._runtime_room_id = None
@@ -336,16 +353,16 @@ class BilibiliLiveWatcherPlugin(Star):
             yield event.plain_result("无法获取当前会话标识（unified_msg_origin 为空）")
             return
 
-        self._set_config_value("target_umo", umo)
+        self._set_config_value("sender.target_umo", umo)
         parts = umo.split(":")
         if len(parts) >= 3:
-            self._set_config_value("target_platform_id", parts[0].strip())
+            self._set_config_value("sender.target_platform_id", parts[0].strip())
             msg_type = parts[1].strip().lower()
             if "friend" in msg_type or "private" in msg_type:
-                self._set_config_value("target_type", "private")
+                self._set_config_value("sender.target_type", "private")
             else:
-                self._set_config_value("target_type", "group")
-            self._set_config_value("target_id", ":".join(parts[2:]).strip())
+                self._set_config_value("sender.target_type", "group")
+            self._set_config_value("sender.target_id", ":".join(parts[2:]).strip())
 
         saved = self._save_config_if_possible()
         suffix = "（已保存）" if saved else "（运行时已生效，未持久化）"
@@ -359,7 +376,7 @@ class BilibiliLiveWatcherPlugin(Star):
             if len(parts) >= 2:
                 raw = parts[-1].strip().lower()
 
-        current = self._to_bool(self.config.get("enabled", True), True)
+        current = self._to_bool(self._config_get("global.enabled", True, legacy_keys=("enabled",)), True)
         if raw in ("on", "enable", "enabled", "true", "1", "开", "开启"):
             new_value = True
         elif raw in ("off", "disable", "disabled", "false", "0", "关", "关闭"):
@@ -367,7 +384,7 @@ class BilibiliLiveWatcherPlugin(Star):
         else:
             new_value = not current
 
-        self._set_config_value("enabled", new_value)
+        self._set_config_value("global.enabled", new_value)
         saved = self._save_config_if_possible()
         suffix = "（已保存）" if saved else "（运行时已生效，未持久化）"
         state = "开启" if new_value else "关闭"
@@ -381,7 +398,10 @@ class BilibiliLiveWatcherPlugin(Star):
             if len(parts) >= 3:
                 raw = parts[-1].strip().lower()
 
-        current = self._to_bool(self.config.get("sync_to_bilibili_live", False), False)
+        current = self._to_bool(
+            self._config_get("global.sync_to_bilibili_live", False, legacy_keys=("sync_to_bilibili_live",)),
+            False,
+        )
         if raw in ("on", "enable", "enabled", "true", "1", "开", "开启"):
             new_value = True
         elif raw in ("off", "disable", "disabled", "false", "0", "关", "关闭"):
@@ -389,7 +409,7 @@ class BilibiliLiveWatcherPlugin(Star):
         else:
             new_value = not current
 
-        self._set_config_value("sync_to_bilibili_live", new_value)
+        self._set_config_value("global.sync_to_bilibili_live", new_value)
         self._bili_live_send_state.enabled = new_value
         saved = self._save_config_if_possible()
         suffix = "（已保存）" if saved else "（运行时已生效，未持久化）"
@@ -610,7 +630,17 @@ class BilibiliLiveWatcherPlugin(Star):
             await self._stop_runtime_clients()
             return
         if cfg.room_id <= 0:
-            self._log_warn_throttled("[bili_watcher] room_id 未配置，已跳过轮询")
+            runtime_alive = bool(
+                (self._audio_task and not self._audio_task.done())
+                or (self._ws_client is not None and self._ws_client.running)
+            )
+            if runtime_alive and self._runtime_room_id:
+                self._log_warn_throttled(
+                    "[bili_watcher] 本轮配置读取到 room_id<=0，已跳过新一轮轮询；"
+                    f"但已有 room_id={self._runtime_room_id} 的运行时仍在继续"
+                )
+            else:
+                self._log_warn_throttled("[bili_watcher] room_id 未配置，已跳过轮询")
             return
 
         target_umo = self._resolve_target_umo(cfg)
@@ -725,7 +755,6 @@ class BilibiliLiveWatcherPlugin(Star):
             cfg.ffmpeg_path,
             cfg.audio_sample_rate,
             cfg.asr_backend,
-            cfg.asr_strategy,
             cfg.asr_model_dir,
             cfg.asr_vad_model_path,
             cfg.asr_vad_threshold,
@@ -736,9 +765,6 @@ class BilibiliLiveWatcherPlugin(Star):
             cfg.asr_sense_voice_use_itn,
             cfg.asr_runtime_probe_required,
             cfg.asr_threads,
-            cfg.asr_vad_enabled,
-            cfg.asr_sentence_pause_seconds,
-            cfg.asr_sentence_min_chars,
         )
         if self._audio_runtime_key == audio_key and self._audio_task and not self._audio_task.done():
             return
@@ -785,7 +811,6 @@ class BilibiliLiveWatcherPlugin(Star):
     def _build_asr_worker(self, cfg: WatchConfig) -> SherpaASRWorker | None:
         if cfg.asr_runtime_probe_required:
             return build_asr_worker_or_none(
-                asr_strategy=cfg.asr_strategy,
                 model_dir=cfg.asr_model_dir,
                 sample_rate=cfg.audio_sample_rate,
                 threads=cfg.asr_threads,
@@ -796,12 +821,8 @@ class BilibiliLiveWatcherPlugin(Star):
                 vad_max_speech_duration=cfg.asr_vad_max_speech_duration,
                 sense_voice_language=cfg.asr_sense_voice_language,
                 sense_voice_use_itn=cfg.asr_sense_voice_use_itn,
-                vad_enabled=cfg.asr_vad_enabled,
-                sentence_pause_seconds=cfg.asr_sentence_pause_seconds,
-                sentence_min_chars=cfg.asr_sentence_min_chars,
             )
         worker = SherpaASRWorker(
-            asr_strategy=cfg.asr_strategy,
             model_dir=cfg.asr_model_dir,
             sample_rate=cfg.audio_sample_rate,
             threads=cfg.asr_threads,
@@ -812,9 +833,6 @@ class BilibiliLiveWatcherPlugin(Star):
             vad_max_speech_duration=cfg.asr_vad_max_speech_duration,
             sense_voice_language=cfg.asr_sense_voice_language,
             sense_voice_use_itn=cfg.asr_sense_voice_use_itn,
-            vad_enabled=cfg.asr_vad_enabled,
-            sentence_pause_seconds=cfg.asr_sentence_pause_seconds,
-            sentence_min_chars=cfg.asr_sentence_min_chars,
         )
         return worker if worker.enabled else None
 
@@ -1052,7 +1070,7 @@ class BilibiliLiveWatcherPlugin(Star):
         danmaku_items: list[DanmakuItem],
         asr_segments: list[ASRSegment],
     ) -> str:
-        provider = self._resolve_provider(target_umo)
+        provider = await self._resolve_provider(cfg=cfg, target_umo=target_umo)
         if provider is None:
             logger.warning("[bili_watcher] no provider available")
             return ""
@@ -1061,7 +1079,7 @@ class BilibiliLiveWatcherPlugin(Star):
             target_umo=target_umo,
             max_messages=DEFAULT_CONVERSATION_CONTEXT_LIMIT,
         )
-        system_prompt = await self._get_system_prompt(target_umo, conversation)
+        system_prompt = await self._get_system_prompt(cfg=cfg, umo=target_umo, conversation=conversation)
         room_meta = await self._get_room_prompt_meta(room_id=room_id, cookie=cfg.bilibili_cookie)
         contexts = self._inject_live_room_contexts(
             contexts=contexts,
@@ -1089,6 +1107,8 @@ class BilibiliLiveWatcherPlugin(Star):
             self_bili_nickname=str(getattr(account_status, "uname", "") or cfg.bili_login_uname or "").strip(),
             fusion=fusion,
             max_reply_chars=cfg.max_reply_chars,
+            prompt_template=cfg.generation_prompt_template,
+            singer_mode_instruction=cfg.singer_mode_instruction,
         )
         self._debug_log_prompt(prompt)
 
@@ -1355,7 +1375,20 @@ class BilibiliLiveWatcherPlugin(Star):
             logger.warning(f"[bili_watcher] get room prompt meta failed: {e}")
             return {}
 
-    def _resolve_provider(self, target_umo: str):
+    async def _maybe_await(self, value: object) -> object:
+        if inspect.isawaitable(value):
+            return await value
+        return value
+
+    async def _resolve_provider(self, *, cfg: WatchConfig, target_umo: str):
+        if cfg.generation_provider_id:
+            provider = await self._resolve_provider_by_id(cfg.generation_provider_id)
+            if provider is not None:
+                return provider
+            logger.warning(
+                "[bili_watcher] configured provider not found: %s; fallback to current provider",
+                cfg.generation_provider_id,
+            )
         try:
             provider = self.context.get_using_provider(umo=target_umo)
         except TypeError:
@@ -1363,6 +1396,99 @@ class BilibiliLiveWatcherPlugin(Star):
         if not provider:
             provider = self.context.get_using_provider()
         return provider
+
+    async def _resolve_provider_by_id(self, provider_id: str):
+        target = str(provider_id or "").strip()
+        if not target:
+            return None
+        manager = getattr(self.context, "provider_manager", None)
+        for owner in (manager, self.context):
+            if owner is None:
+                continue
+            for attr in ("get_provider", "get_provider_by_id", "find_provider", "get"):
+                fn = getattr(owner, attr, None)
+                if not callable(fn):
+                    continue
+                try:
+                    result = await self._maybe_await(fn(target))
+                except TypeError:
+                    continue
+                except Exception:
+                    continue
+                if result is not None:
+                    return result
+        for owner in (manager, self.context):
+            provider = self._find_named_object_in_container(owner, target)
+            if provider is not None:
+                return provider
+        return None
+
+    def _find_named_object_in_container(self, owner: object, target: str):
+        if owner is None:
+            return None
+        candidate_attrs = (
+            "providers",
+            "_providers",
+            "provider_insts",
+            "provider_instances",
+            "all_providers",
+            "personas",
+            "_personas",
+            "persona_insts",
+            "persona_instances",
+            "all_personas",
+        )
+        for attr in candidate_attrs:
+            container = getattr(owner, attr, None)
+            if container is None:
+                continue
+            if isinstance(container, dict):
+                for key, item in container.items():
+                    if str(key or "").strip() == target or self._object_matches_id(item, target):
+                        return item
+                continue
+            items = container
+            try:
+                for item in items:
+                    if self._object_matches_id(item, target):
+                        return item
+            except Exception:
+                continue
+        return None
+
+    def _object_matches_id(self, item: object, target: str) -> bool:
+        if isinstance(item, dict):
+            values = [
+                item.get("id"),
+                item.get("provider_id"),
+                item.get("persona_id"),
+                item.get("name"),
+            ]
+            return any(str(value or "").strip() == target for value in values)
+        values = [
+            getattr(item, "id", None),
+            getattr(item, "provider_id", None),
+            getattr(item, "persona_id", None),
+            getattr(getattr(item, "metadata", None), "id", None),
+            getattr(getattr(item, "meta", None), "id", None),
+            getattr(item, "name", None),
+        ]
+        for value in values:
+            if str(value or "").strip() == target:
+                return True
+        return False
+
+    def _extract_persona_prompt_text(self, persona: object) -> str:
+        if persona is None:
+            return ""
+        if isinstance(persona, dict):
+            return str(persona.get("system_prompt", "") or persona.get("prompt", "")).strip()
+        for attr in ("system_prompt", "prompt"):
+            value = getattr(persona, attr, None)
+            text = str(value or "").strip()
+            if text:
+                return text
+        return ""
 
     async def _run_generation_once(
         self,
@@ -1466,24 +1592,47 @@ class BilibiliLiveWatcherPlugin(Star):
         keywords = ("tool id() not found", "tool result's tool id", "tool_call_id", "tool result")
         return any(k in text for k in keywords)
 
-    async def _get_system_prompt(self, umo: str, conversation: object | None) -> str:
+    async def _get_system_prompt(self, *, cfg: WatchConfig, umo: str, conversation: object | None) -> str:
         persona_mgr = getattr(self.context, "persona_manager", None)
         if not persona_mgr:
             return ""
         try:
+            if cfg.generation_persona_id:
+                persona = await self._resolve_persona_by_id(persona_mgr, cfg.generation_persona_id)
+                prompt = self._extract_persona_prompt_text(persona)
+                if prompt:
+                    return prompt
             if conversation and getattr(conversation, "persona_id", None):
                 persona = await persona_mgr.get_persona(conversation.persona_id)
-                if persona and getattr(persona, "system_prompt", None):
-                    return str(persona.system_prompt)
+                prompt = self._extract_persona_prompt_text(persona)
+                if prompt:
+                    return prompt
             try:
                 default_persona = await persona_mgr.get_default_persona_v3(umo=umo)
             except TypeError:
                 default_persona = await persona_mgr.get_default_persona_v3()
-            if isinstance(default_persona, dict):
-                return str(default_persona.get("prompt", "")).strip()
+            return self._extract_persona_prompt_text(default_persona)
         except Exception as e:
             logger.warning(f"[bili_watcher] get system prompt failed: {e}")
         return ""
+
+    async def _resolve_persona_by_id(self, persona_mgr: object, persona_id: str):
+        target = str(persona_id or "").strip()
+        if not target:
+            return None
+        for attr in ("get_persona", "get_persona_by_id", "find_persona", "get"):
+            fn = getattr(persona_mgr, attr, None)
+            if not callable(fn):
+                continue
+            try:
+                result = await self._maybe_await(fn(target))
+            except TypeError:
+                continue
+            except Exception:
+                continue
+            if result is not None:
+                return result
+        return self._find_named_object_in_container(persona_mgr, target)
 
     def _build_ordered_context(
         self,
@@ -1782,20 +1931,6 @@ class BilibiliLiveWatcherPlugin(Star):
                 return "danmu_only"
         return "danmu_only"
 
-    def _normalize_asr_strategy(self, raw_strategy: object) -> str:
-        strategy = str(raw_strategy or "sensevoice_vad_offline").strip().lower()
-        aliases = {
-            "streaming": "streaming_zipformer",
-            "zipformer": "streaming_zipformer",
-            "sensevoice": "sensevoice_vad_offline",
-            "sense_voice": "sensevoice_vad_offline",
-            "sensevoice_vad": "sensevoice_vad_offline",
-        }
-        strategy = aliases.get(strategy, strategy)
-        if strategy in {"streaming_zipformer", "sensevoice_vad_offline"}:
-            return strategy
-        return "sensevoice_vad_offline"
-
     async def _poll_login_until_complete(self) -> None:
         try:
             while True:
@@ -1858,17 +1993,22 @@ class BilibiliLiveWatcherPlugin(Star):
             except Exception:
                 resolved_account = account
 
-        self._set_config_value("bili_login_cookie", cookie)
-        self._set_config_value("bili_login_refresh_token", refresh_token)
+        existing_manual_cookie = str(
+            self._config_get("user_auth.bili_cookie", "", legacy_keys=("bili_cookie", "bilibili_cookie")) or ""
+        ).strip()
+        self._set_config_value("user_auth.bili_login_cookie", cookie)
+        self._set_config_value("user_auth.bili_login_refresh_token", refresh_token)
         self._set_config_value(
-            "bili_login_uid",
+            "user_auth.bili_login_uid",
             str(getattr(resolved_account, "uid", "") or "").strip(),
         )
         self._set_config_value(
-            "bili_login_uname",
+            "user_auth.bili_login_uname",
             str(getattr(resolved_account, "uname", "") or "").strip(),
         )
-        self._set_config_value("bili_login_saved_at", int(time.time()))
+        self._set_config_value("user_auth.bili_login_saved_at", int(time.time()))
+        if not existing_manual_cookie:
+            self._set_config_value("user_auth.bili_cookie", cookie)
         self._save_config_if_possible()
 
         if resolved_account is not None:
@@ -1886,13 +2026,13 @@ class BilibiliLiveWatcherPlugin(Star):
         self._account_status_cache = None
         self._account_status_cache_ts = 0.0
 
-        self._set_config_value("bili_login_cookie", "")
-        self._set_config_value("bili_login_refresh_token", "")
-        self._set_config_value("bili_login_uid", "")
-        self._set_config_value("bili_login_uname", "")
-        self._set_config_value("bili_login_saved_at", 0)
+        self._set_config_value("user_auth.bili_login_cookie", "")
+        self._set_config_value("user_auth.bili_login_refresh_token", "")
+        self._set_config_value("user_auth.bili_login_uid", "")
+        self._set_config_value("user_auth.bili_login_uname", "")
+        self._set_config_value("user_auth.bili_login_saved_at", 0)
         if clear_manual_cookie:
-            self._set_config_value("bili_cookie", "")
+            self._set_config_value("user_auth.bili_cookie", "")
 
     async def _get_bili_account_status(
         self,
@@ -2054,19 +2194,87 @@ class BilibiliLiveWatcherPlugin(Star):
             return login_cookie, "login"
         return "", "none"
 
+    def _config_get_direct(self, source: object, key: str, default: object = None) -> object:
+        try:
+            if isinstance(source, dict):
+                return source.get(key, default)
+            getter = getattr(source, "get", None)
+            if callable(getter):
+                return getter(key, default)
+        except Exception:
+            pass
+        try:
+            return source[key]  # type: ignore[index]
+        except Exception:
+            return default
+
+    def _config_get(self, path: str, default: object = None, legacy_keys: tuple[str, ...] = ()) -> object:
+        parts = [part.strip() for part in str(path or "").split(".") if part.strip()]
+        current: object = self.config
+        found = True
+        for part in parts:
+            missing = object()
+            value = self._config_get_direct(current, part, missing)
+            if value is missing:
+                found = False
+                break
+            current = value
+        if found:
+            return current
+
+        for legacy_key in legacy_keys:
+            missing = object()
+            value = self._config_get_direct(self.config, legacy_key, missing)
+            if value is not missing:
+                return value
+        return default
+
+    def _config_delete_path(self, path: str):
+        parts = [part.strip() for part in str(path or "").split(".") if part.strip()]
+        if not parts:
+            return
+        current = self.config
+        parents: list[tuple[object, str]] = []
+        for part in parts[:-1]:
+            next_value = self._config_get_direct(current, part, None)
+            if next_value is None:
+                return
+            parents.append((current, part))
+            current = next_value
+        last = parts[-1]
+        try:
+            if isinstance(current, dict):
+                current.pop(last, None)
+            else:
+                del current[last]  # type: ignore[index]
+        except Exception:
+            return
+        for parent, key in reversed(parents):
+            child = self._config_get_direct(parent, key, None)
+            if isinstance(child, dict) and not child:
+                try:
+                    parent.pop(key, None)  # type: ignore[attr-defined]
+                except Exception:
+                    try:
+                        del parent[key]  # type: ignore[index]
+                    except Exception:
+                        break
+            else:
+                break
+
     def _load_config(self) -> WatchConfig:
         reply_interval_seconds = self._to_int(
-            self.config.get("reply_interval_seconds",15),
+            self._config_get("main_loop.reply_interval_seconds", 15, legacy_keys=("reply_interval_seconds",)),
             15,
             1,
         )
         danmaku_trigger_threshold = self._to_int(
-            self.config.get("danmaku_trigger_threshold", 20),
+            self._config_get("main_loop.danmaku_trigger_threshold", 20, legacy_keys=("danmaku_trigger_threshold",)),
             20,
             0,
         )
         asr_trigger_threshold = self._to_int(
-            self.config.get("asr_trigger_threshold", 1),
+            self._config_get("main_loop.asr_trigger_threshold", 1, legacy_keys=("asr_trigger_threshold",)),
             1,
             0,
         )
@@ -2075,41 +2283,87 @@ class BilibiliLiveWatcherPlugin(Star):
             reply_interval_seconds * DEFAULT_CONTEXT_WINDOW_MULTIPLIER,
         )
         context_window_seconds = self._to_int(
-            self.config.get("context_window_seconds", default_context_window_seconds),
+            self._config_get(
+                "main_loop.context_window_seconds",
+                default_context_window_seconds,
+                legacy_keys=("context_window_seconds",),
+            ),
             default_context_window_seconds,
             1,
         )
 
         cookie = str(
-            self.config.get("bili_cookie", self.config.get("bilibili_cookie", "")) or ""
+            self._config_get("user_auth.bili_cookie", "", legacy_keys=("bili_cookie", "bilibili_cookie")) or ""
         ).strip()
-        login_cookie = str(self.config.get("bili_login_cookie", "") or "").strip()
-        login_uid = str(self.config.get("bili_login_uid", "") or "").strip()
-        login_uname = str(self.config.get("bili_login_uname", "") or "").strip()
-        login_refresh_token = str(self.config.get("bili_login_refresh_token", "") or "").strip()
-        login_saved_at = self._to_int(self.config.get("bili_login_saved_at", 0), 0, 0)
+        login_cookie = str(
+            self._config_get("user_auth.bili_login_cookie", "", legacy_keys=("bili_login_cookie",)) or ""
+        ).strip()
+        login_uid = str(
+            self._config_get("user_auth.bili_login_uid", "", legacy_keys=("bili_login_uid",)) or ""
+        ).strip()
+        login_uname = str(
+            self._config_get("user_auth.bili_login_uname", "", legacy_keys=("bili_login_uname",)) or ""
+        ).strip()
+        login_refresh_token = str(
+            self._config_get(
+                "user_auth.bili_login_refresh_token",
+                "",
+                legacy_keys=("bili_login_refresh_token",),
+            )
+            or ""
+        ).strip()
+        login_saved_at = self._to_int(
+            self._config_get("user_auth.bili_login_saved_at", 0, legacy_keys=("bili_login_saved_at",)),
+            0,
+            0,
+        )
         cookie, cookie_source = self._resolve_effective_bili_cookie(
             manual_cookie=cookie,
             login_cookie=login_cookie,
         )
 
         return WatchConfig(
-            enabled=self._to_bool(self.config.get("enabled", True), True),
-            debug=self._to_bool(self.config.get("debug", False), False),
-            room_id=self._to_int(self.config.get("room_id", 0), 0, 0),
+            enabled=self._to_bool(self._config_get("global.enabled", True, legacy_keys=("enabled",)), True),
+            debug=self._to_bool(self._config_get("global.debug", False, legacy_keys=("debug",)), False),
+            room_id=self._to_int(self._config_get("global.room_id", 0, legacy_keys=("room_id",)), 0, 0),
             reply_interval_seconds=reply_interval_seconds,
             context_window_seconds=context_window_seconds,
             danmaku_trigger_threshold=danmaku_trigger_threshold,
             asr_trigger_threshold=asr_trigger_threshold,
-            target_umo=str(self.config.get("target_umo", "") or "").strip(),
-            target_platform_id=str(self.config.get("target_platform_id", "default") or "default").strip(),
-            target_type=str(self.config.get("target_type", "group") or "group").strip(),
-            target_id=str(self.config.get("target_id", "") or "").strip(),
-            max_reply_chars=self._to_int(self.config.get("max_reply_chars", 60), 60, 10),
+            target_umo=str(self._config_get("sender.target_umo", "", legacy_keys=("target_umo",)) or "").strip(),
+            target_platform_id=str(
+                self._config_get("sender.target_platform_id", "default", legacy_keys=("target_platform_id",))
+                or "default"
+            ).strip(),
+            target_type=str(
+                self._config_get("sender.target_type", "group", legacy_keys=("target_type",)) or "group"
+            ).strip(),
+            target_id=str(self._config_get("sender.target_id", "", legacy_keys=("target_id",)) or "").strip(),
+            generation_provider_id=str(
+                self._config_get("generation.provider_id", "", legacy_keys=("generation_provider_id", "provider_id"))
+                or ""
+            ).strip(),
+            generation_persona_id=str(
+                self._config_get("generation.persona_id", "", legacy_keys=("generation_persona_id", "persona_id"))
+                or ""
+            ).strip(),
+            generation_prompt_template=str(
+                self._config_get(
+                    "generation.prompt_template",
+                    DEFAULT_FUSED_PROMPT_TEMPLATE,
+                    legacy_keys=("generation_prompt_template", "prompt_template"),
+                )
+                or DEFAULT_FUSED_PROMPT_TEMPLATE
+            ),
+            max_reply_chars=self._to_int(
+                self._config_get("generation.max_reply_chars", 60, legacy_keys=("max_reply_chars",)),
+                60,
+                10,
+            ),
             bilibili_cookie=cookie,
             bilibili_cookie_source=cookie_source,
             sync_to_bilibili_live=self._to_bool(
-                self.config.get("sync_to_bilibili_live", False),
+                self._config_get("global.sync_to_bilibili_live", False, legacy_keys=("sync_to_bilibili_live",)),
                 False,
             ),
             bili_login_cookie=login_cookie,
@@ -2117,72 +2371,131 @@ class BilibiliLiveWatcherPlugin(Star):
             bili_login_uname=login_uname,
             bili_login_refresh_token=login_refresh_token,
             bili_login_saved_at=login_saved_at,
-            pipeline_mode=self._normalize_pipeline_mode(self.config.get("pipeline_mode", 2)),
+            pipeline_mode=self._normalize_pipeline_mode(
+                self._config_get("global.pipeline_mode", 2, legacy_keys=("pipeline_mode",))
+            ),
             use_realtime_danmaku_ws=INTERNAL_USE_REALTIME_DANMAKU_WS,
             danmu_ws_auth_mode=INTERNAL_DANMU_WS_AUTH_MODE,
             allow_buvid3_only=INTERNAL_ALLOW_BUVID3_ONLY,
             wbi_sign_enabled=INTERNAL_WBI_SIGN_ENABLED,
             audio_pull_protocol=str(
-                self.config.get("audio_pull_protocol", "http_flv") or "http_flv"
+                self._config_get("asr.audio_pull_protocol", "http_flv", legacy_keys=("audio_pull_protocol",))
+                or "http_flv"
             ).strip(),
             audio_pull_api_preference=INTERNAL_AUDIO_PULL_API_PREFERENCE,
             audio_http_headers_enabled=INTERNAL_AUDIO_HTTP_HEADERS_ENABLED,
-            ffmpeg_path=str(self.config.get("ffmpeg_path", "ffmpeg") or "ffmpeg").strip(),
-            audio_sample_rate=self._to_int(self.config.get("audio_sample_rate", 16000), 16000, 8000),
-            asr_backend=str(self.config.get("asr_backend", "sherpa_onnx_rknn") or "sherpa_onnx_rknn").strip(),
-            asr_strategy=self._normalize_asr_strategy(
-                self.config.get("asr_strategy", "sensevoice_vad_offline")
+            ffmpeg_path=str(self._config_get("asr.ffmpeg_path", "ffmpeg", legacy_keys=("ffmpeg_path",)) or "ffmpeg").strip(),
+            audio_sample_rate=self._to_int(
+                self._config_get("asr.audio_sample_rate", 16000, legacy_keys=("audio_sample_rate",)),
+                16000,
+                8000,
             ),
+            asr_backend=str(
+                self._config_get("asr.asr_backend", "sherpa_onnx_rknn", legacy_keys=("asr_backend",))
+                or "sherpa_onnx_rknn"
+            ).strip(),
             asr_model_dir=self._resolve_plugin_path(
-                str(self.config.get("asr_model_dir", DEFAULT_ASR_MODEL_DIR) or DEFAULT_ASR_MODEL_DIR).strip(),
+                str(
+                    self._config_get("asr.asr_model_dir", DEFAULT_ASR_MODEL_DIR, legacy_keys=("asr_model_dir",))
+                    or DEFAULT_ASR_MODEL_DIR
+                ).strip(),
                 DEFAULT_ASR_MODEL_DIR,
             ),
             asr_vad_model_path=self._resolve_plugin_path(
                 str(
-                    self.config.get("asr_vad_model_path", DEFAULT_ASR_VAD_MODEL_PATH)
+                    self._config_get(
+                        "asr.asr_vad_model_path",
+                        DEFAULT_ASR_VAD_MODEL_PATH,
+                        legacy_keys=("asr_vad_model_path",),
+                    )
                     or DEFAULT_ASR_VAD_MODEL_PATH
                 ).strip(),
                 DEFAULT_ASR_VAD_MODEL_PATH,
             ),
-            asr_vad_threshold=self._to_float(self.config.get("asr_vad_threshold", 0.3), 0.3),
+            asr_vad_threshold=self._to_float(
+                self._config_get("asr.asr_vad_threshold", 0.3, legacy_keys=("asr_vad_threshold",)),
+                0.3,
+            ),
             asr_vad_min_silence_duration=self._to_float(
-                self.config.get("asr_vad_min_silence_duration", 0.35),
+                self._config_get(
+                    "asr.asr_vad_min_silence_duration",
+                    0.35,
+                    legacy_keys=("asr_vad_min_silence_duration",),
+                ),
                 0.35,
             ),
             asr_vad_min_speech_duration=self._to_float(
-                self.config.get("asr_vad_min_speech_duration", 0.25),
+                self._config_get(
+                    "asr.asr_vad_min_speech_duration",
+                    0.25,
+                    legacy_keys=("asr_vad_min_speech_duration",),
+                ),
                 0.25,
             ),
             asr_vad_max_speech_duration=self._to_float(
-                self.config.get("asr_vad_max_speech_duration", 20.0),
+                self._config_get(
+                    "asr.asr_vad_max_speech_duration",
+                    20.0,
+                    legacy_keys=("asr_vad_max_speech_duration",),
+                ),
                 20.0,
             ),
             asr_sense_voice_language=str(
-                self.config.get("asr_sense_voice_language", "auto") or "auto"
+                self._config_get(
+                    "asr.asr_sense_voice_language",
+                    "auto",
+                    legacy_keys=("asr_sense_voice_language",),
+                )
+                or "auto"
             ).strip(),
             asr_sense_voice_use_itn=INTERNAL_ASR_SENSE_VOICE_USE_ITN,
             asr_runtime_probe_required=INTERNAL_ASR_RUNTIME_PROBE_REQUIRED,
-            asr_threads=self._to_int(self.config.get("asr_threads", 1), 1, -4),
-            asr_vad_enabled=self._to_bool(self.config.get("asr_vad_enabled", False), False),
-            asr_sentence_pause_seconds=self._to_float(
-                self.config.get("asr_sentence_pause_seconds", 0.8),
-                0.8,
-            ),
-            asr_sentence_min_chars=self._to_int(
-                self.config.get("asr_sentence_min_chars", 2),
-                2,
+            asr_threads=self._to_int(
+                self._config_get("asr.asr_threads", 1, legacy_keys=("asr_threads",)),
                 1,
+                -4,
             ),
-            singer_mode_enabled=self._to_bool(self.config.get("singer_mode_enabled", True), True),
+            singer_mode_enabled=self._to_bool(
+                self._config_get(
+                    "singer.singer_mode_enabled",
+                    self._config_get("other.singer_mode_enabled", True, legacy_keys=("singer_mode_enabled",)),
+                ),
+                True,
+            ),
             singer_mode_keywords=self._to_string_list(
-                self.config.get("singer_mode_keywords", list(DEFAULT_SINGER_KEYWORDS)),
+                self._config_get(
+                    "singer.singer_mode_keywords",
+                    self._config_get(
+                        "other.singer_mode_keywords",
+                        list(DEFAULT_SINGER_KEYWORDS),
+                        legacy_keys=("singer_mode_keywords",),
+                    ),
+                ),
                 list(DEFAULT_SINGER_KEYWORDS),
             ),
             singer_mode_window_seconds=self._to_int(
-                self.config.get("singer_mode_window_seconds", 20),
+                self._config_get(
+                    "singer.singer_mode_window_seconds",
+                    self._config_get(
+                        "other.singer_mode_window_seconds",
+                        20,
+                        legacy_keys=("singer_mode_window_seconds",),
+                    ),
+                ),
                 20,
                 0,
             ),
+            singer_mode_instruction=str(
+                self._config_get(
+                    "singer.singer_mode_instruction",
+                    self._config_get(
+                        "other.singer_mode_instruction",
+                        DEFAULT_SINGER_MODE_INSTRUCTION,
+                        legacy_keys=("singer_mode_instruction",),
+                    ),
+                )
+                or ""
+            ).strip(),
         )
 
     def _to_int(self, value: object, default: int, min_value: int) -> int:
@@ -2239,8 +2552,25 @@ class BilibiliLiveWatcherPlugin(Star):
             self._last_warn_ts = now
 
     def _set_config_value(self, key: str, value: object):
+        parts = [part.strip() for part in str(key or "").split(".") if part.strip()]
+        if not parts:
+            return
         try:
-            self.config[key] = value
+            current = self.config
+            for part in parts[:-1]:
+                next_value = self._config_get_direct(current, part, None)
+                if not isinstance(next_value, dict):
+                    next_value = {}
+                    if isinstance(current, dict):
+                        current[part] = next_value
+                    else:
+                        current[part] = next_value  # type: ignore[index]
+                current = next_value
+            last = parts[-1]
+            if isinstance(current, dict):
+                current[last] = value
+            else:
+                current[last] = value  # type: ignore[index]
         except Exception:
             pass
 
