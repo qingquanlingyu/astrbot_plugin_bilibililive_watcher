@@ -24,8 +24,8 @@
 
 ## 作者人工提示
 
-1. 我是在派上跑的，所以首先用的RKNN模型，不保证其他格式模型可以支持
-2. 推荐下载20-seconds-sense-voice类模型，不推荐也不支持实时（曾经试过实时，但是准确性、断句都很差）
+1. 我是在RK3588上跑的，所以首先用的RKNN模型，不保证其他格式模型可以支持
+2. 推荐下载`20-seconds-sense-voice`类模型，不推荐也不支持实时（曾经试过实时，但是准确性、断句都很差）
 3. 使用`test_live_text_console.py [房间号] --asr`可以快速测试是否跑通
 
 ## 安装与前置
@@ -240,16 +240,3 @@ singer_mode_instruction: "6) 当前是唱歌场景，可以参考弹幕发送“
 - 直播间是否正在开播
 - 模型目录是否存在
 - `silero_vad.onnx` 是否存在
-
-## 升级说明
-
-- 旧配置可以直接沿用。
-- 不开启 `sync_to_bilibili_live` 时，现有发送行为不变。
-- 现有 `bili_cookie` 手工回退链路保留。
-- `pipeline_mode` 现以 `0/1/2` 配置；旧字符串写法仍可兼容读取，但新非法值会回退到 `0(danmu_only)`。
-- `danmaku_trigger_threshold` 允许为 `0`，不再强制抬到 `1`。
-- `audio_enabled` 已废弃；进入 `asr_only` 或 `danmu_plus_asr` 时会自动拉音频。
-- `singer_mode_threshold` 已废弃；Singer Mode 现改为“关键词数组 + 时间窗口”命中规则。
-- `streaming_zipformer` 已彻底移除；`asr_strategy`、`asr_vad_enabled`、`asr_sentence_pause_seconds`、`asr_sentence_min_chars` 已废弃并会在保存配置时清理。
-- 旧版中 `use_realtime_danmaku_ws`、`danmu_ws_auth_mode`、`allow_buvid3_only`、`wbi_sign_enabled`、`audio_pull_api_preference`、`audio_http_headers_enabled`、`asr_sense_voice_use_itn`、`asr_runtime_probe_required` 已改为内部默认值；即使旧配置中保留这些键，也不会再影响运行。
-- 旧版中的 `bili_cookie_file`、`bilibili_cookie_file`、`auto_load_cookie_from_file` 已废弃；保存配置时会被自动清理。
