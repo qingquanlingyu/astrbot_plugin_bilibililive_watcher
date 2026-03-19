@@ -1,6 +1,6 @@
 name: astrbot_plugin_bilibililive_watcher
 display_name: 一起看B站直播！
-desc: 让你AstrBot能看B站直播！定时抓取B站直播间弹幕与语音上下文，触发模型生成短回复，并可双通道发送到AstrBot会话与B站直播弹幕，也可注入会话作为上下文。
+desc: 让你AstrBot能看B站直播！定时抓取B站直播间弹幕与语音上下文，触发模型生成短回复，并可双通道发送到AstrBot会话与B站直播弹幕，也可注入会话作为上下文
 version: v1.1.0
 author: qingquanlingyu
 repo: https://github.com/qingquanlingyu/astrbot_plugin_bilibililive_watcher
