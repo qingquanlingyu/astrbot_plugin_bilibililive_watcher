@@ -24,6 +24,7 @@ except ImportError:  # pragma: no cover
 RKNN_THREAD_VALUES = {1, 0, -1, -2, -3, -4}
 SENTENCE_END_CHARS = "。！？!?；;.\n"
 DEFAULT_MAX_STREAM_SECONDS = 180.0
+DEFAULT_SENSEVOICE_SAFE_DECODE_SECONDS = 18.0
 ASR_STRATEGY_STREAMING_ZIPFORMER = "streaming_zipformer"
 ASR_STRATEGY_SENSEVOICE_VAD_OFFLINE = "sensevoice_vad_offline"
 SUPPORTED_ASR_STRATEGIES = {
@@ -655,52 +656,105 @@ class SherpaASRWorker:
             ts_start=ts_start,
             ts_end=ts_end,
         )
-
-        try:
-            stream = self._recognizer.create_stream()
-            stream.accept_waveform(self.sample_rate, sample_list)
-            self._recognizer.decode_stream(stream)
-            text = _extract_offline_stream_result(self._recognizer, stream)
-        except Exception as e:
+        max_chunk_samples = self._sensevoice_safe_decode_max_samples()
+        chunk_count = max(1, math.ceil(len(sample_list) / max_chunk_samples))
+        if chunk_count > 1:
             self._emit_event(
-                "asr_failure",
-                f"SenseVoice recognition failed: {e}",
-                level="warning",
+                "vad_segment_split",
+                (
+                    "VAD segment exceeds SenseVoice safe decode window; "
+                    f"split into {chunk_count} chunk(s) of <= {max_chunk_samples / self.sample_rate:.2f}s"
+                ),
                 wall_ts=wall_ts_end,
                 ts_start=ts_start,
                 ts_end=ts_end,
             )
-            return []
 
-        normalized = _normalize_sentence_text(text)
-        if not normalized:
-            self._emit_event(
-                "asr_failure",
-                "SenseVoice recognition returned empty result",
-                level="warning",
-                wall_ts=wall_ts_end,
-                ts_start=ts_start,
-                ts_end=ts_end,
+        emitted: list[ASRSegment] = []
+        for chunk_idx in range(chunk_count):
+            offset = chunk_idx * max_chunk_samples
+            chunk_samples = sample_list[offset : offset + max_chunk_samples]
+            if not chunk_samples:
+                continue
+
+            chunk_ts_start = ts_start + (offset / self.sample_rate)
+            chunk_ts_end = chunk_ts_start + (len(chunk_samples) / self.sample_rate)
+            chunk_wall_ts_start = (
+                self._stream_started_wall_ts + chunk_ts_start if self._stream_started_wall_ts > 0 else 0.0
             )
-            return []
+            chunk_wall_ts_end = (
+                self._stream_started_wall_ts + chunk_ts_end if self._stream_started_wall_ts > 0 else 0.0
+            )
+            chunk_label = (
+                f"chunk {chunk_idx + 1}/{chunk_count}"
+                if chunk_count > 1
+                else "segment"
+            )
 
-        segment = ASRSegment(
-            text=_ensure_sentence_terminal(normalized),
-            ts_start=ts_start,
-            ts_end=ts_end,
-            conf=0.6,
-            wall_ts_start=wall_ts_start,
-            wall_ts_end=wall_ts_end,
-        )
-        self._emit_event(
-            "asr_success",
-            f"SenseVoice recognition success: {normalized}",
-            wall_ts=wall_ts_end,
-            ts_start=ts_start,
-            ts_end=ts_end,
-            text=normalized,
-        )
-        return [segment]
+            try:
+                text = self._decode_sensevoice_samples(chunk_samples)
+            except Exception as e:
+                self._emit_event(
+                    "asr_failure",
+                    f"SenseVoice recognition failed on {chunk_label}: {e}",
+                    level="warning",
+                    wall_ts=chunk_wall_ts_end,
+                    ts_start=chunk_ts_start,
+                    ts_end=chunk_ts_end,
+                )
+                continue
+
+            normalized = _normalize_sentence_text(text)
+            if not normalized:
+                self._emit_event(
+                    "asr_failure",
+                    (
+                        "SenseVoice recognition returned empty result"
+                        if chunk_count == 1
+                        else f"SenseVoice recognition returned empty result on {chunk_label}"
+                    ),
+                    level="warning",
+                    wall_ts=chunk_wall_ts_end,
+                    ts_start=chunk_ts_start,
+                    ts_end=chunk_ts_end,
+                )
+                continue
+
+            segment = ASRSegment(
+                text=_ensure_sentence_terminal(normalized),
+                ts_start=chunk_ts_start,
+                ts_end=chunk_ts_end,
+                conf=0.6,
+                wall_ts_start=chunk_wall_ts_start,
+                wall_ts_end=chunk_wall_ts_end,
+            )
+            emitted.append(segment)
+            self._emit_event(
+                "asr_success",
+                (
+                    f"SenseVoice recognition success: {normalized}"
+                    if chunk_count == 1
+                    else f"SenseVoice recognition success on {chunk_label}: {normalized}"
+                ),
+                wall_ts=chunk_wall_ts_end,
+                ts_start=chunk_ts_start,
+                ts_end=chunk_ts_end,
+                text=normalized,
+            )
+        return emitted
+
+    def _sensevoice_safe_decode_max_seconds(self) -> float:
+        configured = max(1.0, float(self.vad_max_speech_duration or 0.0))
+        return max(1.0, min(configured, DEFAULT_SENSEVOICE_SAFE_DECODE_SECONDS))
+
+    def _sensevoice_safe_decode_max_samples(self) -> int:
+        return max(1, int(self._sensevoice_safe_decode_max_seconds() * self.sample_rate))
+
+    def _decode_sensevoice_samples(self, samples: list[float]) -> str:
+        stream = self._recognizer.create_stream()
+        stream.accept_waveform(self.sample_rate, samples)
+        self._recognizer.decode_stream(stream)
+        return _extract_offline_stream_result(self._recognizer, stream)
 
     def _flush_active_vad_segment(self) -> list[ASRSegment]:
         if self._vad is None:

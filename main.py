@@ -916,25 +916,23 @@ class BilibiliLiveWatcherPlugin(Star):
     def _normalize_live_status(self, raw_status: object) -> str:
         if isinstance(raw_status, str):
             normalized = raw_status.strip()
-            if normalized in {"直播中", "未开播", "状态未知"}:
+            if normalized in {"直播中", "未开播"}:
                 return normalized
             lowered = normalized.lower()
             if lowered in {"1", "live", "on", "streaming"}:
                 return "直播中"
-            if lowered in {"0", "offline", "off"}:
+            else:
                 return "未开播"
-            return "状态未知"
         if raw_status is None:
-            return "状态未知"
+            return "未开播"
         try:
             value = int(raw_status)
         except (TypeError, ValueError):
-            return "状态未知"
-        if value > 0:
-            return "直播中"
-        if value == 0:
             return "未开播"
-        return "状态未知"
+        if value == 1:
+            return "直播中"
+        else:
+            return "未开播"
 
     def _build_live_room_state_payload(
         self,
