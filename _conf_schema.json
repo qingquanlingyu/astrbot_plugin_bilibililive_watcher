@@ -57,13 +57,13 @@
         "description": "累计弹幕条数达到该阈值后，才允许触发回复",
         "type": "int",
         "default": 10,
-        "hint": "允许设置为 0；设得越小越积极，设得越大越克制"
+        "hint": "允许设置为 0；设得越小越积极，设得越大越克制，和ASR限制一起生效"
       },
       "asr_trigger_threshold": {
         "description": "累计 ASR 语句条数达到该阈值后，才允许触发回复（danmu_plus_asr / asr_only 模式）",
         "type": "int",
         "default": 10,
-        "hint": "只在启用 ASR 的模式下生效；主播刚开口就想触发可保持 1"
+        "hint": "只在启用 ASR 的模式下生效；和弹幕限制一起生效"
       }
     }
   },
@@ -126,7 +126,7 @@
         "description": "模型生成内容最大字符数",
         "type": "int",
         "default": 30,
-        "hint": "实际下发给模型的字符上限会取 max(10, 该值)"
+        "hint": "实际下发给模型的字符上限会取 max(1, 该值)"
       }
     }
   },
@@ -173,22 +173,22 @@
         "hint": "通常保持 16000；只有模型或设备明确要求时再调整"
       },
       "asr_backend": {
-        "description": "ASR 后端：保留 sherpa_onnx_rknn / sherpa_onnx_cpu_onnx 兼容字段",
+        "description": "ASR 后端：sherpa_onnx_rknn / sherpa_onnx_cpu_onnx",
         "type": "string",
         "default": "sherpa_onnx_rknn",
-        "hint": "RK3588 推荐 sherpa_onnx_rknn；没有 RKNN 时再退回 sherpa_onnx_cpu_onnx"
+        "hint": "RK3588 推荐 sherpa_onnx_rknn；一般通用 sherpa_onnx_cpu_onnx"
       },
       "asr_model_dir": {
-        "description": "sherpa ASR 模型目录；SenseVoice 默认应指向官方 sherpa-onnx RKNN release 目录",
+        "description": "sherpa ASR 模型目录；推荐 SenseVoice",
         "type": "string",
         "default": "./models/sherpa/rknn/sherpa-onnx-rk3588-20-seconds-sense-voice-zh-en-ja-ko-yue-2024-07-17",
-        "hint": "相对路径会按插件目录解析；请指向包含模型文件的完整目录"
+        "hint": "包含模型文件的相对路径，就是模型解压后的文件夹"
       },
       "asr_vad_model_path": {
         "description": "Silero VAD ONNX 模型文件路径（相对插件目录解析）",
         "type": "string",
         "default": "./models/vad/silero_vad.onnx",
-        "hint": "通常无需改动；只有你换了自定义 VAD 模型时才需要修改"
+        "hint": "包含VAD模型文件的相对路径，就是模型解压后的文件夹"
       },
       "asr_vad_threshold": {
         "description": "Silero VAD 触发阈值",
@@ -221,10 +221,10 @@
         "hint": "多语言或不确定场景保持 auto；单语种直播可手工指定"
       },
       "asr_threads": {
-        "description": "ASR 线程 / RKNN NPU core mask（RKNN 推荐 1；兼容 0/-1/-2/-3/-4）",
+        "description": "ASR 线程 / RKNN NPU core mask",
         "type": "int",
         "default": 1,
-        "hint": "RKNN 一般保持 1；只有你明确知道硬件调度需求时再修改"
+        "hint": "一般是1；兼容 0/-1/-2/-3/-4；只有你明确知道硬件调度需求时再修改"
       }
     }
   },
@@ -242,7 +242,7 @@
       "singer_mode_keywords": {
         "description": "Singer Mode 关键词数组；当最近窗口内弹幕包含任一关键词时，判定为唱歌场景",
         "type": "list",
-        "default": ["好听", "打call", "天籁之音", "/\\"],
+        "default": ["好听", "打call", "天籁之音", "/\\", "♬"],
         "hint": "建议放直播间里常见的夸唱歌弹幕关键词；命中任意一个即可触发"
       },
       "singer_mode_window_seconds": {

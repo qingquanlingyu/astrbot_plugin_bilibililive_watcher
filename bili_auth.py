@@ -88,12 +88,26 @@ NAV_HEADERS = {
 }
 
 
-def extract_buvid3(cookie: str) -> str:
+def extract_cookie_value(cookie: str, key: str) -> str:
+    prefix = f"{key}="
     for part in str(cookie or "").split(";"):
         item = part.strip()
-        if item.startswith("buvid3="):
-            return item
+        if item.startswith(prefix):
+            return item[len(prefix) :]
     return ""
+
+
+def extract_buvid3(cookie: str) -> str:
+    value = extract_cookie_value(cookie, "buvid3")
+    return f"buvid3={value}" if value else ""
+
+
+def extract_dede_user_id(cookie: str) -> int:
+    value = extract_cookie_value(cookie, "DedeUserID")
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 class BiliWbiSigner:

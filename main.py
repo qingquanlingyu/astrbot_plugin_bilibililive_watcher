@@ -6,7 +6,6 @@ import json
 import re
 import tempfile
 import time
-from dataclasses import dataclass
 from pathlib import Path
 
 import aiohttp
@@ -23,7 +22,6 @@ except Exception:  # pragma: no cover
 try:  # pragma: no cover
     from .asr_sherpa import SherpaASRWorker, build_asr_worker_or_none
     from .audio_pipe import AudioCaptureWorker, AudioRequestOptions
-    from .bili_auth import extract_buvid3
     from .bili_http import (
         BiliApiError,
         BiliHttpClient,
@@ -33,7 +31,7 @@ try:  # pragma: no cover
     )
     from .bili_ws import DanmakuRealtimeClient
     from .fusion import DEFAULT_SINGER_KEYWORDS, FusionEngine
-    from .models import ASRSegment, DanmakuItem
+    from .models import ASRSegment, ChannelSendState, DanmakuItem, LoginRuntimeState, WatchConfig
     from .prompting import (
         DEFAULT_FUSED_PROMPT_TEMPLATE,
         DEFAULT_SINGER_MODE_INSTRUCTION,
@@ -42,7 +40,6 @@ try:  # pragma: no cover
 except ImportError:  # pragma: no cover
     from asr_sherpa import SherpaASRWorker, build_asr_worker_or_none
     from audio_pipe import AudioCaptureWorker, AudioRequestOptions
-    from bili_auth import extract_buvid3
     from bili_http import (
         BiliApiError,
         BiliHttpClient,
@@ -52,7 +49,7 @@ except ImportError:  # pragma: no cover
     )
     from bili_ws import DanmakuRealtimeClient
     from fusion import DEFAULT_SINGER_KEYWORDS, FusionEngine
-    from models import ASRSegment, DanmakuItem
+    from models import ASRSegment, ChannelSendState, DanmakuItem, LoginRuntimeState, WatchConfig
     from prompting import DEFAULT_FUSED_PROMPT_TEMPLATE, DEFAULT_SINGER_MODE_INSTRUCTION, build_fused_prompt
 
 DEFAULT_ASR_MODEL_DIR = (
@@ -64,6 +61,9 @@ DEFAULT_CONVERSATION_CONTEXT_LIMIT = 12
 DEFAULT_CONTEXT_WINDOW_MULTIPLIER = 3
 DEFAULT_PCM_GAP_LOG_SECONDS = 2.0
 DEFAULT_PCM_HEARTBEAT_SECONDS = 5.0
+DEFAULT_HISTORY_POLL_INTERVAL_WHEN_WS_FATAL_SECONDS = 20.0
+DEFAULT_WS_FATAL_RETRY_COOLDOWN_SECONDS = 20.0
+DEFAULT_WS_IDLE_HISTORY_FALLBACK_SECONDS = 15.0
 INTERNAL_USE_REALTIME_DANMAKU_WS = True
 INTERNAL_DANMU_WS_AUTH_MODE = "signed_wbi"
 INTERNAL_ALLOW_BUVID3_ONLY = True
@@ -93,88 +93,11 @@ HIDDEN_LEGACY_CONFIG_KEYS = (
 )
 PLUGIN_DIR = Path(__file__).resolve().parent
 
-
-@dataclass(slots=True)
-class WatchConfig:
-    enabled: bool
-    debug: bool
-    room_id: int
-    reply_interval_seconds: int
-    context_window_seconds: int
-    danmaku_trigger_threshold: int
-    asr_trigger_threshold: int
-    target_umo: str
-    target_platform_id: str
-    target_type: str
-    target_id: str
-    generation_provider_id: str
-    generation_persona_id: str
-    generation_prompt_template: str
-    max_reply_chars: int
-    bilibili_cookie: str
-    bilibili_cookie_source: str
-    sync_to_bilibili_live: bool
-    bili_login_cookie: str
-    bili_login_uid: str
-    bili_login_uname: str
-    bili_login_refresh_token: str
-    bili_login_saved_at: int
-    pipeline_mode: str
-    use_realtime_danmaku_ws: bool
-    danmu_ws_auth_mode: str
-    allow_buvid3_only: bool
-    wbi_sign_enabled: bool
-    audio_pull_protocol: str
-    audio_pull_api_preference: str
-    audio_http_headers_enabled: bool
-    ffmpeg_path: str
-    audio_sample_rate: int
-    asr_backend: str
-    asr_model_dir: str
-    asr_vad_model_path: str
-    asr_vad_threshold: float
-    asr_vad_min_silence_duration: float
-    asr_vad_min_speech_duration: float
-    asr_vad_max_speech_duration: float
-    asr_sense_voice_language: str
-    asr_sense_voice_use_itn: bool
-    asr_runtime_probe_required: bool
-    asr_threads: int
-    singer_mode_enabled: bool
-    singer_mode_keywords: list[str]
-    singer_mode_window_seconds: int
-    singer_mode_instruction: str
-
-
-@dataclass(slots=True)
-class ChannelSendState:
-    channel: str
-    enabled: bool = False
-    last_attempt_ts: float = 0.0
-    last_success_ts: float = 0.0
-    ok: bool | None = None
-    summary: str = "never"
-    error: str = ""
-    text_preview: str = ""
-
-
-@dataclass(slots=True)
-class LoginRuntimeState:
-    qrcode_key: str = ""
-    url: str = ""
-    image_path: str = ""
-    status: str = "idle"
-    message: str = ""
-    started_ts: float = 0.0
-    expires_at: float = 0.0
-    completed_ts: float = 0.0
-
-
 @register(
     "astrbot_plugin_bilibililive_watcher",
     "YourName",
     "监听B站直播弹幕热度并触发模型生成短弹幕发送到指定会话。",
-    "1.1.0",
+    "1.2.0",
 )
 class BilibiliLiveWatcherPlugin(Star):
     _LLM_REQUEST_SENTINEL_ATTR = "_bili_live_room_injection_applied"
@@ -201,7 +124,9 @@ class BilibiliLiveWatcherPlugin(Star):
         self._runtime_room_id: int | None = None
         self._ws_client: DanmakuRealtimeClient | None = None
         self._ws_runtime_key: tuple | None = None
+        self._ws_retry_after_ts = 0.0
         self._ws_last_message_ts = 0.0
+        self._last_history_poll_ts = 0.0
         self._history_bootstrapped = False
         self._audio_task: asyncio.Task | None = None
         self._audio_runtime_key: tuple | None = None
@@ -254,15 +179,19 @@ class BilibiliLiveWatcherPlugin(Star):
     async def biliwatch_help(self, event: AstrMessageEvent):
         lines = [
             "BiliWatch 可用指令：",
-            "/biliwatch help - 查看本帮助",
-            "/biliwatch status - 查看当前插件状态",
-            "/biliwatch toggle [on|off] - 开关插件",
-            "/biliwatch room <room_id> - 设置监听直播间",
-            "/biliwatch bind - 绑定当前会话为发送目标",
-            "/biliwatch sync-live [on|off] - 开关同步发送到 B 站直播弹幕",
+            "/biliwatch help - 查看完整命令说明",
+            "/biliwatch status - 查看当前运行状态、房间号、登录态和发送状态",
+            "/biliwatch toggle [on|off] - 开启或关闭整个插件，不传参数时自动切换",
+            "/biliwatch room <room_id> - 设置要监听的 B 站直播间号",
+            "/biliwatch bind - 把当前会话绑定为 AstrBot 侧发送目标",
+            "/biliwatch sync-live [on|off] - 开启或关闭同步发送到 B 站直播弹幕",
+            "/biliwatch reply-interval <seconds> - 设置主循环和常规 history 轮询间隔",
+            "/biliwatch context-window <seconds> - 设置保留给融合和 prompt 的上下文窗口",
+            "/biliwatch danmaku-threshold <count> - 设置触发前至少需要多少条弹幕",
+            "/biliwatch asr-threshold <count> - 设置触发前至少需要多少条 ASR 语句",
             "/biliwatch login - 发起 B 站二维码登录（实验性）",
-            "/biliwatch login status - 查看二维码登录进度与账号状态",
-            "/biliwatch logout - 清除插件内保存的 B 站登录态",
+            "/biliwatch login status - 查看二维码登录进度和当前账号状态",
+            "/biliwatch logout - 清除插件内保存的二维码登录态",
         ]
         yield event.plain_result("\n".join(lines))
 
@@ -416,6 +345,54 @@ class BilibiliLiveWatcherPlugin(Star):
         state = "开启" if new_value else "关闭"
         yield event.plain_result(f"已{state}同步发送到 B 站直播弹幕 {suffix}")
 
+    @filter.command("biliwatch reply-interval")
+    async def biliwatch_set_reply_interval(self, event: AstrMessageEvent, value: str = ""):
+        result = self._set_integer_config_from_command(
+            event,
+            explicit_value=value,
+            config_key="main_loop.reply_interval_seconds",
+            label="reply_interval_seconds",
+            min_value=1,
+            example="/biliwatch reply-interval 15",
+        )
+        yield event.plain_result(result)
+
+    @filter.command("biliwatch context-window")
+    async def biliwatch_set_context_window(self, event: AstrMessageEvent, value: str = ""):
+        result = self._set_integer_config_from_command(
+            event,
+            explicit_value=value,
+            config_key="main_loop.context_window_seconds",
+            label="context_window_seconds",
+            min_value=1,
+            example="/biliwatch context-window 45",
+        )
+        yield event.plain_result(result)
+
+    @filter.command("biliwatch danmaku-threshold")
+    async def biliwatch_set_danmaku_threshold(self, event: AstrMessageEvent, value: str = ""):
+        result = self._set_integer_config_from_command(
+            event,
+            explicit_value=value,
+            config_key="main_loop.danmaku_trigger_threshold",
+            label="danmaku_trigger_threshold",
+            min_value=0,
+            example="/biliwatch danmaku-threshold 10",
+        )
+        yield event.plain_result(result)
+
+    @filter.command("biliwatch asr-threshold")
+    async def biliwatch_set_asr_threshold(self, event: AstrMessageEvent, value: str = ""):
+        result = self._set_integer_config_from_command(
+            event,
+            explicit_value=value,
+            config_key="main_loop.asr_trigger_threshold",
+            label="asr_trigger_threshold",
+            min_value=0,
+            example="/biliwatch asr-threshold 2",
+        )
+        yield event.plain_result(result)
+
     @filter.command("biliwatch login")
     async def biliwatch_login(self, event: AstrMessageEvent, action: str = ""):
         raw = str(action or "").strip().lower()
@@ -468,7 +445,7 @@ class BilibiliLiveWatcherPlugin(Star):
             return
 
         self._cleanup_login_qrcode_image()
-        qr_image_path = self._build_login_qrcode_image(qr_session.url)
+        qr_image_path = await self._build_login_qrcode_image(qr_session.url)
         self._login_runtime = LoginRuntimeState(
             qrcode_key=qr_session.qrcode_key,
             url=qr_session.url,
@@ -652,6 +629,7 @@ class BilibiliLiveWatcherPlugin(Star):
         await self._ensure_runtime(cfg, room_id)
 
         if self._should_poll_history(cfg):
+            self._mark_history_poll_attempt()
             items = await self._fetch_history_danmaku(room_id, cfg.bilibili_cookie)
             self._ingest_history_batch(items)
 
@@ -689,7 +667,9 @@ class BilibiliLiveWatcherPlugin(Star):
         if self._runtime_room_id != room_id:
             await self._stop_runtime_clients()
             self._runtime_room_id = room_id
+            self._ws_retry_after_ts = 0.0
             self._ws_last_message_ts = 0.0
+            self._last_history_poll_ts = 0.0
             self._history_bootstrapped = False
             self._room_prompt_meta_room_id = None
             self._room_prompt_meta = {}
@@ -711,8 +691,6 @@ class BilibiliLiveWatcherPlugin(Star):
             return
 
         wbi_cookie = cfg.bilibili_cookie
-        if cfg.allow_buvid3_only:
-            wbi_cookie = extract_buvid3(cfg.bilibili_cookie) or cfg.bilibili_cookie
         ws_key = (
             room_id,
             cfg.bilibili_cookie,
@@ -726,6 +704,8 @@ class BilibiliLiveWatcherPlugin(Star):
             and self._ws_client.running
         ):
             return
+        if self._should_delay_ws_retry(ws_key):
+            return
 
         await self._stop_ws_runtime()
         self._ws_client = DanmakuRealtimeClient(
@@ -734,6 +714,7 @@ class BilibiliLiveWatcherPlugin(Star):
             cookie=cfg.bilibili_cookie,
             wbi_cookie=wbi_cookie,
             ws_require_wbi_sign=cfg.wbi_sign_enabled,
+            prefer_buvid3_ws_cookie=cfg.allow_buvid3_only,
             on_danmaku=self._on_realtime_danmaku,
         )
         self._ws_runtime_key = ws_key
@@ -791,6 +772,7 @@ class BilibiliLiveWatcherPlugin(Star):
             await self._ws_client.stop()
         self._ws_client = None
         self._ws_runtime_key = None
+        self._ws_retry_after_ts = 0.0
         self._ws_last_message_ts = 0.0
 
     async def _stop_audio_runtime(self):
@@ -863,7 +845,12 @@ class BilibiliLiveWatcherPlugin(Star):
                         cookie=cfg.bilibili_cookie,
                     )
                 self._mark_audio_connect(cfg.audio_pull_protocol, urls[0])
-                await capture.run(urls[0], self._on_pcm, request_options=request_options)
+                await capture.run(
+                    urls[0],
+                    self._on_pcm,
+                    request_options=request_options,
+                    on_stderr=self._on_ffmpeg_stderr,
+                )
                 raise RuntimeError("audio stream ended")
             except asyncio.CancelledError:
                 raise
@@ -889,6 +876,11 @@ class BilibiliLiveWatcherPlugin(Star):
         for seg in segments:
             self._record_asr_segment(seg)
             self._debug_log_asr_segment(seg)
+
+    async def _on_ffmpeg_stderr(self, line: str):
+        text = self._sanitize_error_message(line)
+        if text and text != "unknown_error":
+            logger.warning("[bili_watcher] ffmpeg stderr: %s", text)
 
     def _restart_asr_stream(self, reason: str):
         if self._asr_worker is None:
@@ -1047,20 +1039,58 @@ class BilibiliLiveWatcherPlugin(Star):
         return await self._http.get_history_danmaku(room_id=room_id, cookie=cookie)
 
     def _should_poll_history(self, cfg: WatchConfig) -> bool:
-        if cfg.pipeline_mode == "asr_only":
+        reason = self._history_poll_reason(cfg)
+        if reason is None:
             return False
+        if self._last_history_poll_ts <= 0:
+            return True
+        interval_seconds = self._history_poll_interval_seconds(cfg, reason)
+        return (time.time() - self._last_history_poll_ts) >= interval_seconds
+
+    def _history_poll_reason(self, cfg: WatchConfig) -> str | None:
+        if cfg.pipeline_mode == "asr_only":
+            return None
         if not cfg.use_realtime_danmaku_ws or cfg.danmu_ws_auth_mode == "history_only":
-            return True
+            return "history_only"
         if self._ws_client is None:
-            return True
+            return "ws_unavailable"
         if self._ws_client.fatal_error:
-            return True
+            return "ws_fatal"
         if not self._ws_client.connected:
-            return True
+            return "ws_disconnected"
+        idle_threshold = DEFAULT_WS_IDLE_HISTORY_FALLBACK_SECONDS
         if self._ws_last_message_ts <= 0:
+            connected_at = float(getattr(self._ws_client, "connected_at", 0.0) or 0.0)
+            if connected_at > 0 and (time.time() - connected_at) < idle_threshold:
+                return None
+            return "ws_no_message_yet"
+        if (time.time() - self._ws_last_message_ts) >= idle_threshold:
+            return "ws_idle"
+        return None
+
+    def _history_poll_interval_seconds(self, cfg: WatchConfig, reason: str) -> float:
+        interval_seconds = float(max(1, cfg.reply_interval_seconds))
+        if reason == "ws_fatal":
+            return max(interval_seconds, DEFAULT_HISTORY_POLL_INTERVAL_WHEN_WS_FATAL_SECONDS)
+        return interval_seconds
+
+    def _mark_history_poll_attempt(self) -> None:
+        self._last_history_poll_ts = time.time()
+
+    def _should_delay_ws_retry(self, ws_key: tuple) -> bool:
+        if self._ws_client is None or self._ws_runtime_key != ws_key:
+            self._ws_retry_after_ts = 0.0
+            return False
+        if not str(self._ws_client.fatal_error or "").strip():
+            self._ws_retry_after_ts = 0.0
+            return False
+        now = time.time()
+        if self._ws_retry_after_ts <= 0:
+            self._ws_retry_after_ts = now + DEFAULT_WS_FATAL_RETRY_COOLDOWN_SECONDS
+        if now < self._ws_retry_after_ts:
             return True
-        idle_threshold = max(15, cfg.reply_interval_seconds * 2)
-        return (time.time() - self._ws_last_message_ts) >= idle_threshold
+        self._ws_retry_after_ts = 0.0
+        return False
 
     async def _generate_short_reply(
         self,
@@ -1380,6 +1410,35 @@ class BilibiliLiveWatcherPlugin(Star):
             return await value
         return value
 
+    def _get_runtime_config(self, *, umo: str) -> dict:
+        getter = getattr(self.context, "get_config", None)
+        if not callable(getter):
+            return {}
+        try:
+            cfg = getter(umo=umo)
+        except TypeError:
+            try:
+                cfg = getter()
+            except Exception:
+                return {}
+        except Exception as e:
+            logger.warning("[bili_watcher] get runtime config failed umo=%s err=%s", umo, e)
+            return {}
+        if isinstance(cfg, dict):
+            return cfg
+        return {}
+
+    def _get_runtime_provider_settings(self, *, umo: str) -> dict:
+        runtime_cfg = self._get_runtime_config(umo=umo)
+        provider_settings = runtime_cfg.get("provider_settings")
+        if isinstance(provider_settings, dict):
+            return provider_settings
+        return {}
+
+    def _get_runtime_provider_id(self, *, umo: str) -> str:
+        runtime_cfg = self._get_runtime_config(umo=umo)
+        return str(runtime_cfg.get("provider_id", "") or "").strip()
+
     async def _resolve_provider(self, *, cfg: WatchConfig, target_umo: str):
         if cfg.generation_provider_id:
             provider = await self._resolve_provider_by_id(cfg.generation_provider_id)
@@ -1389,6 +1448,11 @@ class BilibiliLiveWatcherPlugin(Star):
                 "[bili_watcher] configured provider not found: %s; fallback to current provider",
                 cfg.generation_provider_id,
             )
+        runtime_provider_id = self._get_runtime_provider_id(umo=target_umo)
+        if runtime_provider_id:
+            provider = await self._resolve_provider_by_id(runtime_provider_id)
+            if provider is not None:
+                return provider
         try:
             provider = self.context.get_using_provider(umo=target_umo)
         except TypeError:
@@ -1511,13 +1575,25 @@ class BilibiliLiveWatcherPlugin(Star):
             except TypeError:
                 llm_resp = await provider.text_chat(prompt)
         except Exception as e:
-            logger.warning(f"[bili_watcher] provider.text_chat failed: {e}")
-            if self._is_tool_context_mismatch_error(e):
+            if self._is_invalid_system_role_error(e):
+                llm_resp = await self._call_provider_without_system_roles(
+                    provider=provider,
+                    prompt=prompt,
+                    contexts=contexts,
+                    system_prompt=system_prompt,
+                )
+                if llm_resp is None:
+                    logger.warning(f"[bili_watcher] provider.text_chat failed after system-role fallback: {e}")
+            elif self._is_tool_context_mismatch_error(e):
                 llm_resp = await self._call_provider_without_contexts(
                     provider=provider,
                     prompt=prompt,
                     system_prompt=system_prompt,
                 )
+                if llm_resp is None:
+                    logger.warning(f"[bili_watcher] provider.text_chat failed after tool-context fallback: {e}")
+            else:
+                logger.warning(f"[bili_watcher] provider.text_chat failed: {e}")
         return self._extract_llm_text(llm_resp)
 
     async def _get_recent_contexts(self, target_umo: str, max_messages: int) -> tuple[object | None, list[dict]]:
@@ -1587,10 +1663,49 @@ class BilibiliLiveWatcherPlugin(Star):
             logger.warning(f"[bili_watcher] retry without contexts failed: {e}")
             return None
 
+    async def _call_provider_without_system_roles(
+        self,
+        *,
+        provider: object,
+        prompt: str,
+        contexts: list[dict],
+        system_prompt: str,
+    ) -> object | None:
+        safe_prompt = self._merge_prompt_with_system_instructions(
+            prompt=prompt,
+            contexts=contexts,
+            system_prompt=system_prompt,
+        )
+        safe_contexts = self._strip_system_contexts(contexts)
+        try:
+            return await provider.text_chat(prompt=safe_prompt, contexts=safe_contexts)
+        except TypeError:
+            pass
+        except Exception as e:
+            logger.warning(f"[bili_watcher] retry without system roles failed: {e}")
+            if self._is_tool_context_mismatch_error(e):
+                return await self._call_provider_without_contexts(provider=provider, prompt=safe_prompt, system_prompt="")
+            return None
+        try:
+            return await provider.text_chat(prompt=safe_prompt)
+        except TypeError:
+            try:
+                return await provider.text_chat(safe_prompt)
+            except Exception as e:
+                logger.warning(f"[bili_watcher] retry without system roles/pure prompt positional failed: {e}")
+                return None
+        except Exception as e:
+            logger.warning(f"[bili_watcher] retry without system roles/pure prompt failed: {e}")
+            return None
+
     def _is_tool_context_mismatch_error(self, err: Exception) -> bool:
         text = str(err).lower()
         keywords = ("tool id() not found", "tool result's tool id", "tool_call_id", "tool result")
         return any(k in text for k in keywords)
+
+    def _is_invalid_system_role_error(self, err: Exception) -> bool:
+        text = str(err).lower()
+        return "invalid message role: system" in text or "invalid role: system" in text
 
     async def _get_system_prompt(self, *, cfg: WatchConfig, umo: str, conversation: object | None) -> str:
         persona_mgr = getattr(self.context, "persona_manager", None)
@@ -1602,6 +1717,13 @@ class BilibiliLiveWatcherPlugin(Star):
                 prompt = self._extract_persona_prompt_text(persona)
                 if prompt:
                     return prompt
+            selected_persona_prompt = await self._get_selected_persona_prompt(
+                persona_mgr=persona_mgr,
+                umo=umo,
+                conversation=conversation,
+            )
+            if selected_persona_prompt:
+                return selected_persona_prompt
             if conversation and getattr(conversation, "persona_id", None):
                 persona = await persona_mgr.get_persona(conversation.persona_id)
                 prompt = self._extract_persona_prompt_text(persona)
@@ -1614,6 +1736,51 @@ class BilibiliLiveWatcherPlugin(Star):
             return self._extract_persona_prompt_text(default_persona)
         except Exception as e:
             logger.warning(f"[bili_watcher] get system prompt failed: {e}")
+        return ""
+
+    async def _get_selected_persona_prompt(
+        self,
+        *,
+        persona_mgr: object,
+        umo: str,
+        conversation: object | None,
+    ) -> str:
+        resolve_selected_persona = getattr(persona_mgr, "resolve_selected_persona", None)
+        if not callable(resolve_selected_persona):
+            return ""
+        conversation_persona_id = None
+        if conversation is not None:
+            raw_persona_id = getattr(conversation, "persona_id", None)
+            if raw_persona_id is not None:
+                text = str(raw_persona_id).strip()
+                conversation_persona_id = text if text else None
+        try:
+            try:
+                resolved = await self._maybe_await(
+                    resolve_selected_persona(
+                        umo=umo,
+                        conversation_persona_id=conversation_persona_id,
+                        platform_name="",
+                        provider_settings=self._get_runtime_provider_settings(umo=umo),
+                    )
+                )
+            except TypeError:
+                resolved = await self._maybe_await(
+                    resolve_selected_persona(
+                        umo=umo,
+                        conversation_persona_id=conversation_persona_id,
+                    )
+                )
+            selected_persona_id, selected_persona, _, _ = resolved
+        except Exception as e:
+            logger.warning("[bili_watcher] resolve selected persona failed umo=%s err=%s", umo, e)
+            return ""
+        prompt = self._extract_persona_prompt_text(selected_persona)
+        if prompt:
+            return prompt
+        if selected_persona_id:
+            persona = await self._resolve_persona_by_id(persona_mgr, str(selected_persona_id))
+            return self._extract_persona_prompt_text(persona)
         return ""
 
     async def _resolve_persona_by_id(self, persona_mgr: object, persona_id: str):
@@ -1766,6 +1933,50 @@ class BilibiliLiveWatcherPlugin(Star):
         except Exception:
             return None
         return TextPart(text=payload)
+
+    @staticmethod
+    def _strip_system_contexts(contexts: list[dict]) -> list[dict]:
+        safe_contexts: list[dict] = []
+        for item in contexts or []:
+            if not isinstance(item, dict):
+                continue
+            role = str(item.get("role", "") or "").strip()
+            content = str(item.get("content", "") or "").strip()
+            if role in ("user", "assistant") and content:
+                safe_contexts.append({"role": role, "content": content})
+        return safe_contexts
+
+    @staticmethod
+    def _merge_prompt_with_system_instructions(
+        *,
+        prompt: str,
+        contexts: list[dict],
+        system_prompt: str,
+    ) -> str:
+        instructions: list[str] = []
+        system_text = str(system_prompt or "").strip()
+        if system_text:
+            instructions.append(system_text)
+        for item in contexts or []:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("role", "") or "").strip() != "system":
+                continue
+            content = str(item.get("content", "") or "").strip()
+            if content:
+                instructions.append(content)
+        merged_prompt = str(prompt or "").strip()
+        if not instructions:
+            return merged_prompt
+        instruction_block = "\n\n".join(instructions)
+        if merged_prompt:
+            return (
+                "请先严格遵循以下附加指令，再生成回复：\n"
+                f"{instruction_block}\n\n"
+                "以下是本次需要回复的用户任务：\n"
+                f"{merged_prompt}"
+            )
+        return instruction_block
 
     def _get_trigger_blockers(self, cfg: WatchConfig) -> list[str]:
         blockers: list[str] = []
@@ -2152,7 +2363,10 @@ class BilibiliLiveWatcherPlugin(Star):
             text = text[:160].rstrip()
         return text
 
-    def _build_login_qrcode_image(self, url: str) -> str:
+    async def _build_login_qrcode_image(self, url: str) -> str:
+        return await asyncio.to_thread(self._render_login_qrcode_image, url)
+
+    def _render_login_qrcode_image(self, url: str) -> str:
         if qrcode is None:
             logger.warning("[bili_watcher] qrcode dependency unavailable, skip QR image rendering")
             return ""
@@ -2550,6 +2764,35 @@ class BilibiliLiveWatcherPlugin(Star):
         if now - self._last_warn_ts >= interval_seconds:
             logger.warning(msg)
             self._last_warn_ts = now
+
+    def _set_integer_config_from_command(
+        self,
+        event: AstrMessageEvent,
+        *,
+        explicit_value: str,
+        config_key: str,
+        label: str,
+        min_value: int,
+        example: str,
+    ) -> str:
+        raw = str(explicit_value or "").strip()
+        if not raw:
+            parts = str(getattr(event, "message_str", "") or "").strip().split()
+            if len(parts) >= 3:
+                raw = parts[-1].strip()
+
+        try:
+            parsed = int(raw)
+            if parsed < min_value:
+                raise ValueError
+        except Exception:
+            min_text = "0 或更大的整数" if min_value == 0 else f"{min_value} 或更大的整数"
+            return f"{label} 无效，请输入{min_text}。例如：{example}"
+
+        self._set_config_value(config_key, parsed)
+        saved = self._save_config_if_possible()
+        suffix = "（已保存）" if saved else "（运行时已生效，未持久化）"
+        return f"已将 {label} 设置为 {parsed} {suffix}"
 
     def _set_config_value(self, key: str, value: object):
         parts = [part.strip() for part in str(key or "").split(".") if part.strip()]

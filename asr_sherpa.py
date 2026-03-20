@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import array
 import importlib
-import logging
 import math
 import re
 import subprocess
@@ -10,10 +9,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-try:
-    from astrbot.api import logger
-except Exception:  # pragma: no cover
-    logger = logging.getLogger("bili_watcher")
+from astrbot.api import logger
 
 try:  # pragma: no cover
     from .models import ASRSegment
@@ -255,8 +251,6 @@ class SherpaASRWorker:
         self._pending_events.append(event)
         if level == "warning":
             logger.warning(f"[bili_watcher] {message}")
-        else:
-            logger.info(f"[bili_watcher] {message}")
 
     def _reset_sensevoice_tracking_state(self):
         self._pcm_remainder = b""
