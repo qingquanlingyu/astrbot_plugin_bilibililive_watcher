@@ -7,6 +7,14 @@
 
 默认升级行为保持不变：`sync_to_bilibili_live=false` 时，仍只发送到 AstrBot。
 
+另外，插件现在提供两个面向 LLM 的工具：
+
+- `bili_live_context_window`
+  - 供模型在“用户询问当前直播内容”时读取近期弹幕和主播语音上下文。
+- `bili_live_send_danmaku`
+  - 供模型在“用户明确要求代发直播弹幕”时直接向当前监听直播间发送 1 条弹幕。
+  - 该工具不依赖 `sync_to_bilibili_live` 开关；它是显式代发工具，不是自动同步开关。
+
 ## 当前能力
 
 - 稳定能力
@@ -22,6 +30,7 @@
   - 插件内二维码登录
 - 配套SKILL
   - bilibili_live_context_fetcher，用于约束模型何时将直播上下文注入自身聊天会话
+  - bilibili_live_danmaku_sender，用于约束模型何时允许代用户向直播间发送弹幕
 
 ## 作者人工提示
 

@@ -140,6 +140,7 @@ class BilibiliLiveWatcherPlugin(Star):
         self._pcm_last_heartbeat_ts = 0.0
         self._fusion = FusionEngine()
         self._live_context_tool_turns: dict[str, float] = {}
+        self._live_send_tool_turns: dict[str, float] = {}
         self._astrbot_send_state = ChannelSendState(channel="astrbot", enabled=True)
         self._bili_live_send_state = ChannelSendState(channel="bilibili_live", enabled=False)
         self._login_runtime = LoginRuntimeState()
@@ -550,6 +551,100 @@ class BilibiliLiveWatcherPlugin(Star):
             room_state=room_state,
             window_seconds=cfg.context_window_seconds,
             ordered_context=ordered_context,
+        )
+
+    @filter.llm_tool(name="bili_live_send_danmaku")
+    async def bili_live_send_danmaku(
+        self,
+        event: AstrMessageEvent,
+        text: str = "",
+    ):
+        """
+        向当前监听的 B 站直播间发送 1 条弹幕。
+        只在用户明确要求你“代发一条直播弹幕/帮我回一句/替我发到直播间”时调用。
+        不要把它当作普通回答工具；如果只是聊直播内容、总结上下文、分析气氛，不要调用。
+        同一轮最多调用一次；若发送失败，不要在同一轮自动重试或改写后重复发送。
+        Args:
+            text(string): 要发送的弹幕正文
+        """
+        cfg = self._load_config()
+        if not cfg.enabled:
+            return self._dump_live_send_tool_result(
+                allowed=False,
+                sent=False,
+                reason="plugin_disabled",
+                room_state=self._build_live_room_state_payload(cfg=cfg, room_id=cfg.room_id, room_meta={}),
+                text="",
+                max_chars=cfg.max_reply_chars,
+                auto_sync_enabled=cfg.sync_to_bilibili_live,
+            )
+        if cfg.room_id <= 0:
+            return self._dump_live_send_tool_result(
+                allowed=False,
+                sent=False,
+                reason="room_not_configured",
+                room_state=self._build_live_room_state_payload(cfg=cfg, room_id=cfg.room_id, room_meta={}),
+                text="",
+                max_chars=cfg.max_reply_chars,
+                auto_sync_enabled=cfg.sync_to_bilibili_live,
+            )
+
+        room_id = await self._resolve_real_room_id(cfg.room_id, cfg.bilibili_cookie)
+        room_meta = await self._get_room_prompt_meta(room_id=room_id, cookie=cfg.bilibili_cookie)
+        room_state = self._build_live_room_state_payload(cfg=cfg, room_id=room_id, room_meta=room_meta)
+        if room_state["live_status"] != "直播中":
+            return self._dump_live_send_tool_result(
+                allowed=False,
+                sent=False,
+                reason="room_not_live",
+                room_state=room_state,
+                text="",
+                max_chars=cfg.max_reply_chars,
+                auto_sync_enabled=cfg.sync_to_bilibili_live,
+            )
+
+        turn_key = self._build_live_context_tool_turn_key(event)
+        self._prune_tool_turns(self._live_send_tool_turns)
+        if turn_key and turn_key in self._live_send_tool_turns:
+            return self._dump_live_send_tool_result(
+                allowed=False,
+                sent=False,
+                reason="already_sent_this_turn",
+                room_state=room_state,
+                text="",
+                max_chars=cfg.max_reply_chars,
+                auto_sync_enabled=cfg.sync_to_bilibili_live,
+            )
+
+        raw_text = str(text) or ""
+        normalized_text = self._normalize_reply(raw_text, cfg.max_reply_chars)
+        if not normalized_text:
+            return self._dump_live_send_tool_result(
+                allowed=False,
+                sent=False,
+                reason="empty_message",
+                room_state=room_state,
+                text="",
+                max_chars=cfg.max_reply_chars,
+                auto_sync_enabled=cfg.sync_to_bilibili_live,
+            )
+
+        send_result = await self._perform_bili_live_send(
+            cfg=cfg,
+            room_id=room_id,
+            reply=normalized_text,
+            trigger="llm_tool",
+        )
+        if turn_key:
+            self._live_send_tool_turns[turn_key] = time.time()
+        return self._dump_live_send_tool_result(
+            allowed=True,
+            sent=bool(send_result.get("ok", False)),
+            reason=str(send_result.get("reason", "") or ""),
+            room_state=room_state,
+            text=normalized_text,
+            max_chars=cfg.max_reply_chars,
+            auto_sync_enabled=cfg.sync_to_bilibili_live,
         )
 
     @filter.on_llm_request()
@@ -1202,6 +1297,22 @@ class BilibiliLiveWatcherPlugin(Star):
         logger.warning(f"[bili_watcher] send_message failed, target={target_umo}")
 
     async def _send_bili_live_reply(self, *, cfg: WatchConfig, room_id: int, reply: str) -> None:
+        await self._perform_bili_live_send(
+            cfg=cfg,
+            room_id=room_id,
+            reply=reply,
+            trigger="watch_loop",
+        )
+
+    async def _perform_bili_live_send(
+        self,
+        *,
+        cfg: WatchConfig,
+        room_id: int,
+        reply: str,
+        trigger: str,
+    ) -> dict[str, object]:
+        self._bili_live_send_state.enabled = bool(cfg.sync_to_bilibili_live or trigger == "llm_tool")
         if self._http is None:
             self._record_channel_send_result(
                 self._bili_live_send_state,
@@ -1210,7 +1321,7 @@ class BilibiliLiveWatcherPlugin(Star):
                 error="BiliHttpClient is not initialized",
                 text_preview=reply,
             )
-            return
+            return {"ok": False, "reason": "http_client_unavailable"}
 
         if not cfg.bilibili_cookie:
             self._record_channel_send_result(
@@ -1220,7 +1331,7 @@ class BilibiliLiveWatcherPlugin(Star):
                 error="no effective bilibili cookie available",
                 text_preview=reply,
             )
-            return
+            return {"ok": False, "reason": "not_logged_in"}
 
         try:
             result = await self._http.send_live_danmaku(
@@ -1236,12 +1347,13 @@ class BilibiliLiveWatcherPlugin(Star):
                 text_preview=reply,
             )
             logger.info(
-                "[bili_watcher] sent live danmaku room=%s source=%s text=%s",
+                "[bili_watcher] sent live danmaku room=%s source=%s trigger=%s text=%s",
                 room_id,
                 cfg.bilibili_cookie_source,
+                trigger,
                 reply[:120],
             )
-            return
+            return {"ok": True, "reason": "ok", "code": result.code, "message": result.message or "ok"}
         except BiliLoginRequiredError as e:
             self._account_status_cache = BiliLoginAccount(
                 is_logged_in=False,
@@ -1256,6 +1368,7 @@ class BilibiliLiveWatcherPlugin(Star):
                 error=self._sanitize_error_message(e),
                 text_preview=reply,
             )
+            reason = "login_required"
         except BiliApiError as e:
             self._record_channel_send_result(
                 self._bili_live_send_state,
@@ -1264,6 +1377,7 @@ class BilibiliLiveWatcherPlugin(Star):
                 error=self._sanitize_error_message(e),
                 text_preview=reply,
             )
+            reason = "api_error"
         except Exception as e:
             self._record_channel_send_result(
                 self._bili_live_send_state,
@@ -1272,13 +1386,16 @@ class BilibiliLiveWatcherPlugin(Star):
                 error=self._sanitize_error_message(e),
                 text_preview=reply,
             )
+            reason = "exception"
         logger.warning(
-            "[bili_watcher] live danmaku send failed room=%s source=%s summary=%s error=%s",
+            "[bili_watcher] live danmaku send failed room=%s source=%s trigger=%s summary=%s error=%s",
             room_id,
             cfg.bilibili_cookie_source,
+            trigger,
             self._bili_live_send_state.summary,
             self._bili_live_send_state.error,
         )
+        return {"ok": False, "reason": reason, "error": self._bili_live_send_state.error}
 
     def _record_channel_send_result(
         self,
@@ -1862,12 +1979,16 @@ class BilibiliLiveWatcherPlugin(Star):
         return "|".join(parts)
 
     def _prune_live_context_tool_turns(self):
-        if not self._live_context_tool_turns:
+        self._prune_tool_turns(self._live_context_tool_turns)
+
+    @staticmethod
+    def _prune_tool_turns(turns: dict[str, float], ttl_seconds: int = 3600):
+        if not turns:
             return
-        cutoff = time.time() - 3600
-        self._live_context_tool_turns = {
-            key: ts for key, ts in self._live_context_tool_turns.items() if ts >= cutoff
-        }
+        cutoff = time.time() - max(60, int(ttl_seconds or 0))
+        stale_keys = [key for key, ts in turns.items() if ts < cutoff]
+        for key in stale_keys:
+            turns.pop(key, None)
 
     def _dump_live_context_tool_result(
         self,
@@ -1884,6 +2005,36 @@ class BilibiliLiveWatcherPlugin(Star):
             "room_state": room_state,
             "window_seconds": max(0, int(window_seconds or 0)),
             "ordered_context": list(ordered_context or []),
+        }
+        return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+    def _dump_live_send_tool_result(
+        self,
+        *,
+        allowed: bool,
+        sent: bool,
+        reason: str,
+        room_state: dict[str, object],
+        text: str,
+        max_chars: int,
+        auto_sync_enabled: bool,
+    ) -> str:
+        payload = {
+            "allowed": bool(allowed),
+            "sent": bool(sent),
+            "reason": str(reason or ""),
+            "room_state": room_state,
+            "max_chars": max(0, int(max_chars or 0)),
+            "text": str(text or ""),
+            "text_preview": self._mask_reply_preview(text),
+            "tool_enabled": True,
+            "auto_sync_enabled": bool(auto_sync_enabled),
+            "send_state": {
+                "enabled": True,
+                "ok": self._bili_live_send_state.ok,
+                "summary": self._bili_live_send_state.summary,
+                "error": self._bili_live_send_state.error,
+            },
         }
         return json.dumps(payload, ensure_ascii=False, sort_keys=True)
 
