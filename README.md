@@ -60,12 +60,15 @@ https://github.com/k2-fsa/sherpa-onnx/releases/tag/asr-models
 - `/biliwatch bind`
   把当前会话绑定为 AstrBot 侧的消息发送目标。
   一般建议先进入目标群聊或私聊后执行一次。
+- `/biliwatch auto-reply [on|off]`
+  控制是否允许插件自动调用 LLM 生成弹幕回复。
+  关闭时仍会持续保存直播弹幕和 ASR 上下文，但不会自动生成或发送回复。
 - `/biliwatch sync-live [on|off]`
   控制是否把生成结果同时发送到 B 站直播弹幕。
   默认建议关闭，先在 AstrBot 会话里观察效果。
 - `/biliwatch reply-interval <seconds>`
-  设置主循环间隔。
-  这个值同时会影响常规 history 轮询频率，越小越及时，请求也越频繁。
+  设置主循环检查间隔。
+  history 轮询使用内置较小间隔，和这个值解耦。
 - `/biliwatch context-window <seconds>`
   设置上下文保留窗口。
   值越大，模型能参考的近期弹幕和 ASR 越多，但也更容易混入旧话题。
@@ -88,10 +91,11 @@ https://github.com/k2-fsa/sherpa-onnx/releases/tag/asr-models
 
 1. 在希望接收生成结果的群聊或私聊里执行 `/biliwatch bind`
 2. 执行 `/biliwatch room <room_id>`
-3. 用 `/biliwatch status` 确认配置是否生效
-4. 如需调节灵敏度，再用：
+3. 如果需要自动回复，再执行 `/biliwatch auto-reply on`
+4. 用 `/biliwatch status` 确认配置是否生效
+5. 如需调节灵敏度，再用：
    `reply-interval`、`context-window`、`danmaku-threshold`、`asr-threshold`
-5. 如果想把内容真正发回 B 站直播间，再执行 `/biliwatch login` 和 `/biliwatch sync-live on`
+6. 如果想把内容真正发回 B 站直播间，再执行 `/biliwatch login` 和 `/biliwatch sync-live on`
 
 ## 安装与前置
 
@@ -133,6 +137,7 @@ debug: false
 
 room_id: 0
 pipeline_mode: 2
+auto_reply_enabled: false
 
 # main_loop
 reply_interval_seconds: 30

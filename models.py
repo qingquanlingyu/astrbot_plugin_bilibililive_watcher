@@ -9,6 +9,7 @@ class WatchConfig:
     enabled: bool
     debug: bool
     room_id: int
+    auto_reply_enabled: bool
     reply_interval_seconds: int
     context_window_seconds: int
     danmaku_trigger_threshold: int

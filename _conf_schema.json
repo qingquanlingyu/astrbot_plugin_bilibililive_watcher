@@ -2,7 +2,7 @@
   "global":{
     "type": "object",
     "description": "全局配置",
-    "hint": "插件的全局开关性配置",
+    "hint": "插件的全局配置",
     "items": {
       "enabled": {
         "description": "是否启用 B 站弹幕监听任务",
@@ -33,28 +33,34 @@
         "type": "bool",
         "default": false,
         "hint": "开启后会把生成结果真正发到直播间；测试阶段建议先关闭"
-      }
-    }
-  },
-  "main_loop": {
-    "type": "object",
-    "description": "主循环与触发条件",
-    "hint": "控制轮询周期、上下文窗口和触发阈值",
-    "items": {
-      "reply_interval_seconds": {
-        "description": "统一循环时间（秒）：同时用于主循环检查与 history 轮询",
-        "type": "int",
-        "default": 30,
-        "hint": "越小越及时，但请求更频繁；通常 10 到 20 秒比较合适"
       },
       "context_window_seconds": {
-        "description": "上下文保留窗口（秒）：控制参与融合与 prompt 的最近弹幕/ASR 历史范围",
+        "description": "上下文保留窗口（秒）：控制参与自动弹幕与上下文注入的最近弹幕/ASR 历史范围",
         "type": "int",
         "default": 300,
         "hint": "窗口越大，参考信息越多，但也更容易把旧话题带进来。如果仅用于会话中注入直播内容，可以根据模型上下文窗口开很大"
+      }
+    }
+  },
+  "danmu_loop": {
+    "type": "object",
+    "description": "自动触发弹幕循环配置",
+    "hint": "控制轮询周期、上下文窗口和触发阈值",
+    "items": {
+      "auto_reply_enabled": {
+        "description": "是否允许插件自动调用 LLM 生成弹幕回复",
+        "type": "bool",
+        "default": false,
+        "hint": "关闭后仍会持续采集直播弹幕和 ASR 上下文，但不会自动生成或发送回复"
+      },
+      "reply_interval_seconds": {
+        "description": "自动触发弹幕的循环检查时间（秒）",
+        "type": "int",
+        "default": 30,
+        "hint": "只影响主循环检查与自动回复判定节奏；不影响上下文管理"
       },
       "danmaku_trigger_threshold": {
-        "description": "累计弹幕条数达到该阈值后，才允许触发回复",
+        "description": "累计弹幕条数达到该阈值后，才允许触发自动弹幕",
         "type": "int",
         "default": 10,
         "hint": "允许设置为 0；设得越小越积极，设得越大越克制，和ASR限制一起生效"
@@ -69,8 +75,8 @@
   },
   "sender": {
     "type": "object",
-    "description": "生成弹幕时，会发送给哪个会话",
-    "hint": "一般用于实现一起看直播，或用于调试，推荐使用/biliwatch bind一键绑定",
+    "description": "自动生成弹幕时，会发送给哪个会话",
+    "hint": "需要开启自动弹幕生成，一般用于实现一起看直播，或用于调试，推荐使用/biliwatch bind一键绑定",
     "items": {
       "target_umo": {
         "description": "直接指定消息目标 UMO（例如 aiocqhttp:GroupMessage:123456789）",

@@ -61,7 +61,7 @@ DEFAULT_CONVERSATION_CONTEXT_LIMIT = 12
 DEFAULT_CONTEXT_WINDOW_MULTIPLIER = 3
 DEFAULT_PCM_GAP_LOG_SECONDS = 2.0
 DEFAULT_PCM_HEARTBEAT_SECONDS = 5.0
-DEFAULT_HISTORY_POLL_INTERVAL_WHEN_WS_FATAL_SECONDS = 20.0
+DEFAULT_HISTORY_POLL_INTERVAL_SECONDS = 5.0
 DEFAULT_WS_FATAL_RETRY_COOLDOWN_SECONDS = 20.0
 DEFAULT_WS_IDLE_HISTORY_FALLBACK_SECONDS = 15.0
 INTERNAL_USE_REALTIME_DANMAKU_WS = True
@@ -128,6 +128,7 @@ class BilibiliLiveWatcherPlugin(Star):
         self._ws_last_message_ts = 0.0
         self._last_history_poll_ts = 0.0
         self._history_bootstrapped = False
+        self._history_task: asyncio.Task | None = None
         self._audio_task: asyncio.Task | None = None
         self._audio_runtime_key: tuple | None = None
         self._asr_worker: SherpaASRWorker | None = None
@@ -185,8 +186,9 @@ class BilibiliLiveWatcherPlugin(Star):
             "/biliwatch toggle [on|off] - 开启或关闭整个插件，不传参数时自动切换",
             "/biliwatch room <room_id> - 设置要监听的 B 站直播间号",
             "/biliwatch bind - 把当前会话绑定为 AstrBot 侧发送目标",
+            "/biliwatch auto-reply [on|off] - 开启或关闭自动生成弹幕回复",
             "/biliwatch sync-live [on|off] - 开启或关闭同步发送到 B 站直播弹幕",
-            "/biliwatch reply-interval <seconds> - 设置主循环和常规 history 轮询间隔",
+            "/biliwatch reply-interval <seconds> - 设置主循环检查间隔",
             "/biliwatch context-window <seconds> - 设置保留给融合和 prompt 的上下文窗口",
             "/biliwatch danmaku-threshold <count> - 设置触发前至少需要多少条弹幕",
             "/biliwatch asr-threshold <count> - 设置触发前至少需要多少条 ASR 语句",
@@ -199,7 +201,7 @@ class BilibiliLiveWatcherPlugin(Star):
     @filter.command("biliwatch status")
     async def biliwatch_status(self, event: AstrMessageEvent):
         cfg = self._load_config()
-        self._astrbot_send_state.enabled = True
+        self._astrbot_send_state.enabled = cfg.auto_reply_enabled
         self._bili_live_send_state.enabled = cfg.sync_to_bilibili_live
         target_umo = self._resolve_target_umo(cfg)
         platform_ids = self._get_available_platform_ids()
@@ -220,6 +222,7 @@ class BilibiliLiveWatcherPlugin(Star):
                     f"debug: {cfg.debug}",
                     f"pipeline_mode: {cfg.pipeline_mode}",
                     f"room_id: {cfg.room_id}",
+                    f"auto_reply_enabled: {cfg.auto_reply_enabled}",
                     f"generation_provider_id: {cfg.generation_provider_id or '(default)'}",
                     f"generation_persona_id: {cfg.generation_persona_id or '(default)'}",
                     (
@@ -319,6 +322,34 @@ class BilibiliLiveWatcherPlugin(Star):
         suffix = "（已保存）" if saved else "（运行时已生效，未持久化）"
         state = "开启" if new_value else "关闭"
         yield event.plain_result(f"已{state} B站直播监听 {suffix}")
+
+    @filter.command("biliwatch auto-reply")
+    async def biliwatch_auto_reply(self, event: AstrMessageEvent, value: str = ""):
+        raw = str(value or "").strip().lower()
+        if not raw:
+            parts = event.message_str.strip().split()
+            if len(parts) >= 3:
+                raw = parts[-1].strip().lower()
+
+        current = self._to_bool(
+            self._config_get("global.auto_reply_enabled", False, legacy_keys=("auto_reply_enabled",)),
+            False,
+        )
+        if raw in ("on", "enable", "enabled", "true", "1", "开", "开启"):
+            new_value = True
+        elif raw in ("off", "disable", "disabled", "false", "0", "关", "关闭"):
+            new_value = False
+        else:
+            new_value = not current
+
+        self._set_config_value("global.auto_reply_enabled", new_value)
+        if not new_value:
+            self._buffer.clear()
+            self._asr_buffer.clear()
+        saved = self._save_config_if_possible()
+        suffix = "（已保存）" if saved else "（运行时已生效，未持久化）"
+        state = "开启" if new_value else "关闭"
+        yield event.plain_result(f"已{state}自动生成弹幕回复 {suffix}")
 
     @filter.command("biliwatch sync-live")
     async def biliwatch_sync_live(self, event: AstrMessageEvent, value: str = ""):
@@ -715,20 +746,20 @@ class BilibiliLiveWatcherPlugin(Star):
                 self._log_warn_throttled("[bili_watcher] room_id 未配置，已跳过轮询")
             return
 
-        target_umo = self._resolve_target_umo(cfg)
-        if not target_umo:
-            self._log_warn_throttled("[bili_watcher] 发送目标未配置，已跳过轮询")
-            return
-
         room_id = await self._resolve_real_room_id(cfg.room_id, cfg.bilibili_cookie)
         await self._ensure_runtime(cfg, room_id)
 
-        if self._should_poll_history(cfg):
-            self._mark_history_poll_attempt()
-            items = await self._fetch_history_danmaku(room_id, cfg.bilibili_cookie)
-            self._ingest_history_batch(items)
-
         self._prune_old(cfg.context_window_seconds)
+        if not cfg.auto_reply_enabled:
+            self._buffer.clear()
+            self._asr_buffer.clear()
+            return
+
+        target_umo = self._resolve_target_umo(cfg)
+        if not target_umo:
+            self._log_warn_throttled("[bili_watcher] 自动回复已开启，但发送目标未配置，已跳过本轮生成")
+            return
+
         trigger_blockers = self._get_trigger_blockers(cfg)
         if trigger_blockers:
             logger.warning("[bili_watcher] skip trigger: %s", " | ".join(trigger_blockers))
@@ -770,7 +801,16 @@ class BilibiliLiveWatcherPlugin(Star):
             self._room_prompt_meta = {}
 
         await self._ensure_ws_runtime(cfg, room_id)
+        await self._ensure_history_runtime(room_id)
         await self._ensure_audio_runtime(cfg, room_id)
+
+    async def _ensure_history_runtime(self, room_id: int):
+        if self._history_task and not self._history_task.done():
+            return
+        self._history_task = asyncio.create_task(
+            self._history_poll_loop(room_id),
+            name=f"bili-history-poll-{room_id}",
+        )
 
     async def _ensure_ws_runtime(self, cfg: WatchConfig, room_id: int):
         if self._http is None:
@@ -859,8 +899,17 @@ class BilibiliLiveWatcherPlugin(Star):
         )
 
     async def _stop_runtime_clients(self):
+        await self._stop_history_runtime()
         await self._stop_ws_runtime()
         await self._stop_audio_runtime()
+
+    async def _stop_history_runtime(self):
+        if self._history_task is not None:
+            self._history_task.cancel()
+            await asyncio.gather(self._history_task, return_exceptions=True)
+        self._history_task = None
+        self._last_history_poll_ts = 0.0
+        self._history_bootstrapped = False
 
     async def _stop_ws_runtime(self):
         if self._ws_client is not None:
@@ -992,40 +1041,53 @@ class BilibiliLiveWatcherPlugin(Star):
             self._record_asr_segment(seg)
             self._debug_log_asr_segment(seg)
 
-    def _ingest_danmaku(self, item: DanmakuItem):
+    def _ingest_danmaku(
+        self,
+        item: DanmakuItem,
+        *,
+        include_pending: bool = True,
+        prune_now: bool = True,
+    ) -> bool:
         key = item.dedup_key or f"{item.uid}|{item.timeline}|{item.text}"
         if key in self._seen:
-            return
+            return False
         self._seen[key] = time.time()
-        self._buffer.append(item)
+        if include_pending:
+            self._buffer.append(item)
         self._context_danmaku_buffer.append(item)
+        if prune_now:
+            self._prune_old_with_current_window()
         self._debug_log_danmaku(item)
+        return True
 
     def _ingest_history_batch(self, items: list[DanmakuItem]) -> int:
+        context_added = 0
         if not self._history_bootstrapped:
-            seen_ts = time.time()
             for item in items:
-                key = item.dedup_key or f"{item.uid}|{item.timeline}|{item.text}"
-                self._seen[key] = seen_ts
+                if self._ingest_danmaku(item, include_pending=False, prune_now=False):
+                    context_added += 1
             self._history_bootstrapped = True
-            if items:
+            if context_added:
+                self._prune_old_with_current_window()
                 logger.info(
-                    "[bili_watcher] history bootstrap skipped %d backlog item(s)",
-                    len(items),
+                    "[bili_watcher] history bootstrap loaded %d backlog item(s) into context only",
+                    context_added,
                 )
             return 0
 
         ingested = 0
         for item in items:
-            before = len(self._buffer)
-            self._ingest_danmaku(item)
-            if len(self._buffer) > before:
+            if self._ingest_danmaku(item, prune_now=False):
                 ingested += 1
+                context_added += 1
+        if context_added:
+            self._prune_old_with_current_window()
         return ingested
 
     def _record_asr_segment(self, seg: ASRSegment):
         self._asr_buffer.append(seg)
         self._context_asr_buffer.append(seg)
+        self._prune_old_with_current_window()
         logger.info(
             "[bili_watcher] ASR segment emitted: text=%r audio=(%.2f-%.2f) wall=(%.2f-%.2f) conf=%.2f",
             seg.text,
@@ -1133,6 +1195,31 @@ class BilibiliLiveWatcherPlugin(Star):
             return []
         return await self._http.get_history_danmaku(room_id=room_id, cookie=cookie)
 
+    async def _history_poll_loop(self, room_id: int):
+        while True:
+            try:
+                cfg = self._load_config()
+                if not cfg.enabled or self._runtime_room_id != room_id:
+                    await asyncio.sleep(DEFAULT_HISTORY_POLL_INTERVAL_SECONDS)
+                    continue
+                reason = self._history_poll_reason(cfg)
+                if reason is not None:
+                    self._mark_history_poll_attempt()
+                    items = await self._fetch_history_danmaku(room_id, cfg.bilibili_cookie)
+                    ingested = self._ingest_history_batch(items)
+                    if ingested > 0:
+                        logger.info(
+                            "[bili_watcher] history poll ingested %d item(s), reason=%s",
+                            ingested,
+                            reason,
+                        )
+                await asyncio.sleep(DEFAULT_HISTORY_POLL_INTERVAL_SECONDS)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning(f"[bili_watcher] history poll failed: {e}")
+                await asyncio.sleep(DEFAULT_HISTORY_POLL_INTERVAL_SECONDS)
+
     def _should_poll_history(self, cfg: WatchConfig) -> bool:
         reason = self._history_poll_reason(cfg)
         if reason is None:
@@ -1163,11 +1250,8 @@ class BilibiliLiveWatcherPlugin(Star):
             return "ws_idle"
         return None
 
-    def _history_poll_interval_seconds(self, cfg: WatchConfig, reason: str) -> float:
-        interval_seconds = float(max(1, cfg.reply_interval_seconds))
-        if reason == "ws_fatal":
-            return max(interval_seconds, DEFAULT_HISTORY_POLL_INTERVAL_WHEN_WS_FATAL_SECONDS)
-        return interval_seconds
+    def _history_poll_interval_seconds(self, _cfg: WatchConfig, _reason: str) -> float:
+        return DEFAULT_HISTORY_POLL_INTERVAL_SECONDS
 
     def _mark_history_poll_attempt(self) -> None:
         self._last_history_poll_ts = time.time()
@@ -2182,6 +2266,13 @@ class BilibiliLiveWatcherPlugin(Star):
             if (seg.wall_ts_end <= 0) or ((seg.wall_ts_end or seg.ts_end) >= asr_cutoff)
         ]
 
+    def _prune_old_with_current_window(self) -> None:
+        try:
+            context_window_seconds = self._load_config().context_window_seconds
+        except Exception:
+            context_window_seconds = 1
+        self._prune_old(context_window_seconds)
+
     def _resolve_target_umo(self, cfg: WatchConfig) -> str:
         platform_ids = self._get_available_platform_ids()
         platform_id = self._pick_platform_id(cfg.target_platform_id, platform_ids)
@@ -2691,6 +2782,10 @@ class BilibiliLiveWatcherPlugin(Star):
             enabled=self._to_bool(self._config_get("global.enabled", True, legacy_keys=("enabled",)), True),
             debug=self._to_bool(self._config_get("global.debug", False, legacy_keys=("debug",)), False),
             room_id=self._to_int(self._config_get("global.room_id", 0, legacy_keys=("room_id",)), 0, 0),
+            auto_reply_enabled=self._to_bool(
+                self._config_get("global.auto_reply_enabled", False, legacy_keys=("auto_reply_enabled",)),
+                False,
+            ),
             reply_interval_seconds=reply_interval_seconds,
             context_window_seconds=context_window_seconds,
             danmaku_trigger_threshold=danmaku_trigger_threshold,
