@@ -20,6 +20,15 @@
 - 稳定能力
   - 直播间弹幕监听与去重
   - 直播音频拉流 + ASR 融合
+  - 直播视频分段录制
+  - 录制 session 下的 timeline 落盘
+  - 人工按 `HH:MM:SS` 范围查看 ASR 参考文本
+  - 人工按 `HH:MM:SS` 范围导出 clip
+  - AI 候选片段扫描与审核队列
+  - 候选片段查看 ASR、调整范围、确认导出、拒绝
+  - 基于已导出 clip 的后台投稿队列
+  - 投稿作业状态查询与失败重试
+  - 基于 `biliup` 的投稿后端
   - 定时触发生成短回复
   - 发送到 AstrBot 会话
   - 手工 `bili_cookie` 回退
@@ -60,6 +69,10 @@ https://github.com/k2-fsa/sherpa-onnx/releases/tag/asr-models
 - `/biliwatch bind`
   把当前会话绑定为 AstrBot 侧的消息发送目标。
   一般建议先进入目标群聊或私聊后执行一次。
+- `/biliwatch record on|off`
+  控制是否在后台持续录制直播分段。
+- `/biliwatch record status`
+  查看当前录制 session、已生成分段数和最近错误。
 - `/biliwatch auto-reply [on|off]`
   控制是否允许插件自动调用 LLM 生成弹幕回复。
   关闭时仍会持续保存直播弹幕和 ASR 上下文，但不会自动生成或发送回复。
@@ -78,6 +91,42 @@ https://github.com/k2-fsa/sherpa-onnx/releases/tag/asr-models
 - `/biliwatch asr-threshold <count>`
   设置触发生成前至少需要积累多少条 ASR 语句。
   只在启用了 ASR 的模式下生效；设为 `0` 表示不要求 ASR 条数门槛。
+- `/biliwatch asr range <HH:MM:SS> <HH:MM:SS>`
+  返回该时间范围内的 ASR 参考文本，每行都带 session 相对时间。
+- `/biliwatch clip range <HH:MM:SS> <HH:MM:SS>`
+  直接导出这两个时间点之间的 clip。
+- `/biliwatch clip review list`
+  查看当前 session 的 AI 候选片段列表，会显示候选 ID、状态、开始时间、结束时间和摘要。
+- `/biliwatch clip review scan`
+  立即扫描一次当前 session，基于最近一个 `context_window_seconds` 窗口尝试生成候选。
+- `/biliwatch clip review asr <clip_id>`
+  查看该候选当前时间范围内的 ASR 参考文本。
+- `/biliwatch clip review set-range <clip_id> <HH:MM:SS> <HH:MM:SS>`
+  重新指定候选的开始和结束时间。
+- `/biliwatch clip review approve <clip_id>`
+  将候选片段标记为已确认，并立即导出。
+  导出时会尽量复用候选片段原本的 ID，而不是再生成新的 clip ID。
+- `/biliwatch clip review reject <clip_id>`
+  将候选片段标记为已拒绝。
+- `/biliwatch publish submit <clip_id> [title]`
+  为已导出的 clip 创建投稿草稿。
+  默认只生成标题、简介、标签、分区建议，不会立即上传。
+- `/biliwatch publish update-title <job_id> <title>`
+  修改投稿草稿标题。
+- `/biliwatch publish update-desc <job_id> <desc>`
+  修改投稿草稿简介。
+- `/biliwatch publish update-tags <job_id> <tag1,tag2>`
+  修改投稿草稿标签，使用英文逗号分隔。
+- `/biliwatch publish update-tid <job_id> <tid>`
+  修改投稿草稿分区。
+- `/biliwatch publish approve <job_id>`
+  人工确认草稿后，才开始后台上传和投递。
+- `/biliwatch publish list`
+  查看最近投稿作业及其状态。
+- `/biliwatch publish status <job_id>`
+  查看指定投稿作业的标题、状态、重试次数、失败原因和最终 `aid` / `bvid`。
+- `/biliwatch publish retry <job_id>`
+  重试 `retry_waiting` 或 `failed` 的投稿作业。
 - `/biliwatch login`
   发起 B 站二维码登录。
   成功后插件会保存登录态，供直播弹幕发送等能力使用。
@@ -93,9 +142,10 @@ https://github.com/k2-fsa/sherpa-onnx/releases/tag/asr-models
 2. 执行 `/biliwatch room <room_id>`
 3. 如果需要自动回复，再执行 `/biliwatch auto-reply on`
 4. 用 `/biliwatch status` 确认配置是否生效
-5. 如需调节灵敏度，再用：
-   `reply-interval`、`context-window`、`danmaku-threshold`、`asr-threshold`
-6. 如果想把内容真正发回 B 站直播间，再执行 `/biliwatch login` 和 `/biliwatch sync-live on`
+5. 如果需要查看回放上下文，用 `/biliwatch asr range 00:10:00 00:12:30`
+6. 如果模型已经产出候选，用 `clip review list -> clip review asr -> clip review set-range -> clip review approve / reject`
+7. 如果想把确认后的 clip 投稿，先开启 `publish.enabled`，再执行 `publish submit -> publish status / update-* -> publish approve`
+8. 如果想把内容真正发回 B 站直播间，再执行 `/biliwatch login` 和 `/biliwatch sync-live on`
 
 ## 安装与前置
 
@@ -104,6 +154,7 @@ https://github.com/k2-fsa/sherpa-onnx/releases/tag/asr-models
 插件根目录已提供 `requirements.txt`。AstrBot 安装插件时会按官方机制安装：
 
 - `aiohttp`
+- `biliup`
 - `sherpa-onnx`
 
 `requirements.txt` 已优先指向 sherpa-onnx 的 RKNN 发布来源，但最终是否拿到正确 RKNN wheel，仍以运行时探测结果为准。
@@ -164,19 +215,36 @@ bili_login_cookie: ""
 # 新增：是否同步发送到 B 站直播弹幕
 sync_to_bilibili_live: false
 
+recording_enabled: false
+recording_mode: 0  # 0=仅录制 1=录制+时间轴 2=录制+时间轴+AI候选
+clip_ai_enabled: false
+publish:
+  enabled: false
+  default_visibility: "self_only"
+  max_retries: 3
+  retry_backoff_seconds: 300
+  default_tid: 0
+  default_tags: ""
+  use_tid_predict: true
+  use_tag_recommendation: true
+  cover_strategy: "midpoint_frame"
+  title_template: "{{room_title}} {{clip_range}} 切片"
+  desc_template: "主播：{{anchor_name}}\n直播间：https://live.bilibili.com/{{real_room_id}}\n日期：{{clip_date}}\n\n{{auto_desc}}"
+
 audio_pull_protocol: "http_flv"
 ffmpeg_path: "ffmpeg"
 audio_sample_rate: 16000
+
+segment_duration_seconds: 300
+output_container: "mkv"
+runtime_root: "/mnt/ssd/bilibili"
+
+clip_ai_prompt_template: "默认已内置返回 HH:MM:SS 起止时间的候选扫描模板"
 
 asr_backend: "sherpa_onnx_rknn"
 asr_model_dir: "./models/sherpa/rknn/sherpa-onnx-rk3588-20-seconds-sense-voice-zh-en-ja-ko-yue-2024-07-17"
 asr_vad_model_path: "./models/vad/silero_vad.onnx"
 asr_threads: 1
-
-singer_mode_enabled: true
-singer_mode_keywords: ["好听", "打call", "天籁之音", "/\\"]
-singer_mode_window_seconds: 20
-singer_mode_instruction: "6) 当前是唱歌场景，可以参考弹幕发送“好听”或“打call”，严禁根据主播歌词回复。"
 ```
 
 ## 故障排查
@@ -209,7 +277,26 @@ singer_mode_instruction: "6) 当前是唱歌场景，可以参考弹幕发送“
 
 这类失败不会阻断 AstrBot 侧发送。
 
-### 3. 二维码登录失败或超时
+### 3. 投稿作业失败
+
+检查：
+
+- `/biliwatch publish status <job_id>`
+- `publish.enabled`
+- `bili_cookie_source`
+- `publish.default_visibility`
+- `biliup` 是否已随插件依赖正确安装
+
+常见原因：
+
+- 未登录或 cookie 中缺少 `bili_jct`
+- clip 文件已被移动或删除
+- `biliup` 依赖未安装
+- B 站上传限流、验证码或风控
+
+这类失败不会影响录制、ASR、弹幕监听和弹幕发送主链路。
+
+### 4. 二维码登录失败或超时
 
 二维码登录是实验性能力。若出现：
 
@@ -221,7 +308,7 @@ singer_mode_instruction: "6) 当前是唱歌场景，可以参考弹幕发送“
 
 - `bili_cookie`
 
-### 4. 音频不可用
+### 5. 音频不可用
 
 检查：
 

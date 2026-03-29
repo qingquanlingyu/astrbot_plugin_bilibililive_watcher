@@ -3,5 +3,6 @@
 --find-links https://k2-fsa.github.io/sherpa/onnx/rk-npu.html
 
 aiohttp>=3.9,<4
+biliup==1.1.29
 qrcode[pil]>=7.4,<8
 sherpa-onnx

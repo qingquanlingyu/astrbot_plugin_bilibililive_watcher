@@ -28,6 +28,18 @@
         "default": 2,
         "hint": "一般保持 2 即可；1 会只看主播语音，0 会只看观众弹幕"
       },
+      "recording_enabled": {
+        "description": "是否启用直播录制",
+        "type": "bool",
+        "default": false,
+        "hint": "开启后会在后台持续录制直播分段，并供后续人工切片使用"
+      },
+      "recording_mode": {
+        "description": "录制模式：0=仅录制；1=录制+时间轴；2=录制+时间轴+AI候选",
+        "type": "int",
+        "default": 0,
+        "hint": "推荐 1；如果你要启用 AI 候选审核，就设为 2"
+      },
       "sync_to_bilibili_live": {
         "description": "是否在发送到 AstrBot 会话的同时，同步发送到 B 站直播弹幕；默认关闭",
         "type": "bool",
@@ -126,7 +138,7 @@
         "description": "自定义生成 prompt 模板，为空使用内置",
         "hint": "使用双层花括号内嵌变量：{{anchor_name}}（主播名称）、{{room_title}}（直播间标题）、{{reply_length_limit}}（生成字符数限制）、{{context_json}}（上下文信息的 JSON 字符串）等。留空则使用默认模板。建议在模板中明确要求生成适合直播弹幕风格的内容，并合理利用上下文变量。",
         "type": "string",
-        "default": "下面是 B 站直播间中的主播语音转写与观众弹幕信息。\n主播昵称：{{anchor_name}}\n直播间标题：{{room_title}}\n直播间房间号：{{room_id}}\n你当前在 B 站直播间使用的昵称：{{self_bili_nickname}}\n请基于这些信息，按照你当前的人设，生成 1 条适合发送到直播间的互动弹幕。\n输出要求：\n1) 只输出一句话，不要解释，不要 Markdown。\n2) 长度不超过 {{reply_length_limit}} 字，口语自然。\n3) 不要过分强调人设，不要攻击性，模仿已有弹幕风格。\n4) 优先参考 ordered_context 中按时间排序后的事件序列，理解弹幕与语音内容的先后关系，越近的越优先。\n5) 如果 ordered_context 中某条弹幕的 speaker 与你当前 B 站昵称相同，那就是你自己之前发过的弹幕；不要把它作为风格参考。\n{{singer_mode_instruction}}\n\nordered_context:\n{{context_json}}"
+        "default": "下面是 B 站直播间中的主播语音转写与观众弹幕信息。\n主播昵称：{{anchor_name}}\n直播间标题：{{room_title}}\n直播间房间号：{{room_id}}\n你当前在 B 站直播间使用的昵称：{{self_bili_nickname}}\n请基于这些信息，按照你当前的人设，生成 1 条适合发送到直播间的互动弹幕。\n输出要求：\n1) 只输出一句话，不要解释，不要 Markdown。\n2) 长度不超过 {{reply_length_limit}} 字，口语自然。\n3) 不要过分强调人设，不要攻击性，模仿已有弹幕风格。\n4) 优先参考 ordered_context 中按时间排序后的事件序列，理解弹幕与语音内容的先后关系，越近的越优先。\n5) 如果 ordered_context 中某条弹幕的 speaker 与你当前 B 站昵称相同，那就是你自己之前发过的弹幕；不要把它作为风格参考。\n\nordered_context:\n{{context_json}}"
       },
       "max_reply_chars": {
         "description": "模型生成内容最大字符数",
@@ -234,34 +246,133 @@
       }
     }
   },
-  "singer":{
+  "recording": {
     "type": "object",
-    "description": "唱歌检测设置",
-    "hint": "此功能用于根据弹幕检测主播是否正在唱歌，进而避免生成不合场合的弹幕",
+    "description": "直播录制设置",
+    "hint": "控制分段录制、容器和最长会话时长",
     "items": {
-      "singer_mode_enabled": {
-        "description": "是否启用 Singer Mode 判断",
+      "segment_duration_seconds": {
+        "description": "录制分段时长（秒）",
+        "type": "int",
+        "default": 600,
+        "hint": "不是专业录播软件，不建议太长，默认 600 秒"
+      },
+      "output_container": {
+        "description": "原始录制素材容器格式",
+        "type": "string",
+        "default": "mkv",
+        "hint": "默认 mkv，更稳；如需兼容性更高可改为 mp4"
+      },
+      "max_session_hours": {
+        "description": "单次录制会话最长时长（小时）",
+        "type": "int",
+        "default": 12,
+        "hint": "用于防止异常情况下无限增长"
+      }
+    }
+  },
+  "clip_ai": {
+    "type": "object",
+    "description": "AI 候选片段扫描设置",
+    "hint": "扫描严格复用 context_window_seconds 窗口，要求模型明确返回 HH:MM:SS 起止时间；确认候选后会直接导出",
+    "items": {
+      "enabled": {
+        "description": "是否启用 AI 候选片段扫描",
+        "type": "bool",
+        "default": false,
+        "hint": "只有在 global.recording_mode=2 时才会生效"
+      },
+      "prompt_template": {
+        "description": "AI 候选扫描 prompt 模板",
+        "type": "string",
+        "default": "你是直播切片候选助手。下面给你的是当前录播 session 最近一个窗口内的直播上下文。\n主播昵称：{{anchor_name}}\n直播间标题：{{room_title}}\n直播间房间号：{{room_id}}\n当前扫描窗口：{{window_start}} - {{window_end}}\n窗口时长：{{window_seconds}} 秒\n\n任务：\n1) 只在你能明确判断片段起止时间时，返回 1 个候选切片。\n2) 起止时间必须使用 session 相对时间，格式必须是 HH:MM:SS。\n3) 如果当前窗口里没有足够明确、值得人工复审的片段，直接输出 NO_CLIP。\n4) 不要输出模糊范围，不要输出“前后几秒”之类描述。\n5) 返回 JSON，格式如下：\n{\"start_time\":\"HH:MM:SS\",\"end_time\":\"HH:MM:SS\",\"topic\":\"一句短标题\",\"summary\":\"一句中文摘要\"}\n\n直播上下文 JSON：\n{{context_json}}",
+        "hint": "建议让模型只在能明确给出开始和结束时间时返回 JSON，否则直接输出 NO_CLIP"
+      }
+    }
+  },
+  "publish": {
+    "type": "object",
+    "description": "B站投稿设置",
+    "hint": "基于已导出的 clip 创建后台投稿作业；默认关闭，且默认仅自己可见",
+    "items": {
+      "enabled": {
+        "description": "是否启用后台投稿功能",
+        "type": "bool",
+        "default": false,
+        "hint": "关闭时 /biliwatch publish 相关命令会直接返回未启用"
+      },
+      "default_visibility": {
+        "description": "默认可见性",
+        "type": "string",
+        "default": "self_only",
+        "hint": "v1 只支持 self_only；不要改成公开投稿"
+      },
+      "max_retries": {
+        "description": "后台投稿最大重试次数",
+        "type": "int",
+        "default": 3,
+        "hint": "仅用于可重试失败，例如网络超时、5xx 或临时风控"
+      },
+      "retry_backoff_seconds": {
+        "description": "失败后重试退避秒数",
+        "type": "int",
+        "default": 300,
+        "hint": "默认 5 分钟，先保守一点"
+      },
+      "default_tid": {
+        "description": "默认投稿分区 tid",
+        "type": "int",
+        "default": 0,
+        "hint": "推荐接口不可用时使用；0 表示交给后续逻辑继续兜底"
+      },
+      "default_tags": {
+        "description": "默认标签（逗号分隔）",
+        "type": "string",
+        "default": "",
+        "hint": "例如：切片,直播；推荐标签接口不可用时会回退到这里"
+      },
+      "use_tid_predict": {
+        "description": "是否尝试调用推荐分区接口",
         "type": "bool",
         "default": true,
-        "hint": "开启后会根据最近弹幕命中情况识别唱歌场景"
+        "hint": "关闭后直接使用 default_tid"
       },
-      "singer_mode_keywords": {
-        "description": "Singer Mode 关键词数组；当最近窗口内弹幕包含任一关键词时，判定为唱歌场景",
-        "type": "list",
-        "default": ["好听", "打call", "天籁之音", "/\\", "♬"],
-        "hint": "建议放直播间里常见的夸唱歌弹幕关键词；命中任意一个即可触发"
+      "use_tag_recommendation": {
+        "description": "是否尝试调用推荐标签接口",
+        "type": "bool",
+        "default": true,
+        "hint": "关闭后直接使用 default_tags"
       },
-      "singer_mode_window_seconds": {
-        "description": "Singer Mode 判定窗口（秒）；以最近弹幕为基准回看该时间内是否命中关键词",
-        "type": "int",
-        "default": 20,
-        "hint": "窗口越大越容易判定为唱歌场景，但也更容易拖尾"
-      },
-      "singer_mode_instruction": {
-        "description": "判定为唱歌场景后，额外插入到 prompt 中的约束说明",
+      "cover_strategy": {
+        "description": "默认封面策略",
         "type": "string",
-        "default": "6) 当前是唱歌场景，可以参考弹幕发送“好听”或“打call”，严禁根据主播歌词回复。",
-        "hint": "支持在 prompt_template 中通过 {{singer_mode_instruction}} 引用；留空表示唱歌场景不额外补充说明"
+        "default": "midpoint_frame",
+        "hint": "v1 只支持从 clip 中间抽帧"
+      },
+      "title_template": {
+        "description": "默认标题模板",
+        "type": "string",
+        "default": "{{room_title}} {{clip_range}} 切片",
+        "hint": "支持 {{room_title}} {{anchor_name}} {{clip_range}} {{clip_date}} {{clip_id}}"
+      },
+      "desc_template": {
+        "description": "默认简介模板",
+        "type": "string",
+        "default": "主播：{{anchor_name}}\n直播间：https://live.bilibili.com/{{real_room_id}}\n日期：{{clip_date}}\n\n{{auto_desc}}",
+        "hint": "固定前缀顺序必须保持为主播、直播间、日期；正文部分可通过 {{auto_desc}} 拼装"
+      }
+    }
+  },
+  "storage": {
+    "type": "object",
+    "description": "运行态目录设置",
+    "hint": "录制分段、timeline、clips 都会落在这里，而不是源码目录",
+    "items": {
+      "runtime_root": {
+        "description": "录制与切片运行态根目录",
+        "type": "string",
+        "default": "/mnt/ssd/bilibili",
+        "hint": "默认写入 SSD 路径，目录结构为 recordings/{room_id}/{session_id}"
       }
     }
   }

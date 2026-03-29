@@ -19,7 +19,7 @@ try:  # pragma: no cover
 except Exception:  # pragma: no cover
     qrcode = None
 
-try:  # pragma: no cover
+if __package__:
     from .asr_sherpa import SherpaASRWorker, build_asr_worker_or_none
     from .audio_pipe import AudioCaptureWorker, AudioRequestOptions
     from .bili_http import (
@@ -30,14 +30,23 @@ try:  # pragma: no cover
         DEFAULT_UA,
     )
     from .bili_ws import DanmakuRealtimeClient
-    from .fusion import DEFAULT_SINGER_KEYWORDS, FusionEngine
+    from .clip_ai import ClipPlannerRuntime
+    from .clip_time import format_hhmmss, get_session_started_at, resolve_range_to_wall_ts, wall_ts_to_hhmmss
+    from .clip_exporter import ClipExporterRuntime, ClipRange, find_clip_by_id
+    from .clip_review import ClipCandidateStore
+    from .fusion import FusionEngine
     from .models import ASRSegment, ChannelSendState, DanmakuItem, LoginRuntimeState, WatchConfig
+    from .publish_metadata import build_publish_draft
+    from .publish_queue import PublishJob, PublishRuntime
     from .prompting import (
+        DEFAULT_CLIP_REVIEW_PROMPT_TEMPLATE,
         DEFAULT_FUSED_PROMPT_TEMPLATE,
-        DEFAULT_SINGER_MODE_INSTRUCTION,
         build_fused_prompt,
     )
-except ImportError:  # pragma: no cover
+    from .recording_manifest import SessionLayout, load_session_index, update_session_index
+    from .recording_runtime import LiveRecorderRuntime
+    from .timeline_store import TimelineIndexerRuntime, query_asr_range
+else:  # pragma: no cover
     from asr_sherpa import SherpaASRWorker, build_asr_worker_or_none
     from audio_pipe import AudioCaptureWorker, AudioRequestOptions
     from bili_http import (
@@ -48,9 +57,22 @@ except ImportError:  # pragma: no cover
         DEFAULT_UA,
     )
     from bili_ws import DanmakuRealtimeClient
-    from fusion import DEFAULT_SINGER_KEYWORDS, FusionEngine
+    from clip_ai import ClipPlannerRuntime
+    from clip_time import format_hhmmss, get_session_started_at, resolve_range_to_wall_ts, wall_ts_to_hhmmss
+    from clip_exporter import ClipExporterRuntime, ClipRange, find_clip_by_id
+    from clip_review import ClipCandidateStore
+    from fusion import FusionEngine
     from models import ASRSegment, ChannelSendState, DanmakuItem, LoginRuntimeState, WatchConfig
-    from prompting import DEFAULT_FUSED_PROMPT_TEMPLATE, DEFAULT_SINGER_MODE_INSTRUCTION, build_fused_prompt
+    from publish_metadata import build_publish_draft
+    from publish_queue import PublishJob, PublishRuntime
+    from prompting import (
+        DEFAULT_CLIP_REVIEW_PROMPT_TEMPLATE,
+        DEFAULT_FUSED_PROMPT_TEMPLATE,
+        build_fused_prompt,
+    )
+    from recording_manifest import SessionLayout, load_session_index, update_session_index
+    from recording_runtime import LiveRecorderRuntime
+    from timeline_store import TimelineIndexerRuntime, query_asr_range
 
 DEFAULT_ASR_MODEL_DIR = (
     "./models/sherpa/rknn/"
@@ -64,6 +86,12 @@ DEFAULT_PCM_HEARTBEAT_SECONDS = 5.0
 DEFAULT_HISTORY_POLL_INTERVAL_SECONDS = 5.0
 DEFAULT_WS_FATAL_RETRY_COOLDOWN_SECONDS = 20.0
 DEFAULT_WS_IDLE_HISTORY_FALLBACK_SECONDS = 15.0
+DEFAULT_ROOM_META_CACHE_SECONDS = 10.0
+DEFAULT_RECORDING_RUNTIME_ROOT = "/mnt/ssd/bilibili"
+DEFAULT_MARK_PRE_SECONDS = 60
+DEFAULT_MARK_POST_SECONDS = 120
+DEFAULT_CLIP_MIN_DURATION_SECONDS = 15
+DEFAULT_CLIP_MAX_DURATION_SECONDS = 600
 INTERNAL_USE_REALTIME_DANMAKU_WS = True
 INTERNAL_DANMU_WS_AUTH_MODE = "signed_wbi"
 INTERNAL_ALLOW_BUVID3_ONLY = True
@@ -121,6 +149,7 @@ class BilibiliLiveWatcherPlugin(Star):
         self._real_room_id_source: int | None = None
         self._room_prompt_meta_room_id: int | None = None
         self._room_prompt_meta: dict[str, object] = {}
+        self._room_prompt_meta_ts = 0.0
         self._runtime_room_id: int | None = None
         self._ws_client: DanmakuRealtimeClient | None = None
         self._ws_runtime_key: tuple | None = None
@@ -132,6 +161,14 @@ class BilibiliLiveWatcherPlugin(Star):
         self._audio_task: asyncio.Task | None = None
         self._audio_runtime_key: tuple | None = None
         self._asr_worker: SherpaASRWorker | None = None
+        self._recording_runtime: LiveRecorderRuntime | None = None
+        self._recording_runtime_key: tuple | None = None
+        self._timeline_runtime: TimelineIndexerRuntime | None = None
+        self._timeline_runtime_key: tuple | None = None
+        self._active_session_layout: SessionLayout | None = None
+        self._active_session_id: str = ""
+        self._last_recording_session_root: str = ""
+        self._last_clip_ai_scan_ts = 0.0
         self._audio_conn_seq = 0
         self._current_audio_conn = 0
         self._pcm_total_chunks = 0
@@ -148,12 +185,23 @@ class BilibiliLiveWatcherPlugin(Star):
         self._login_poll_task: asyncio.Task | None = None
         self._account_status_cache: BiliLoginAccount | None = None
         self._account_status_cache_ts = 0.0
+        self._publish_runtime: PublishRuntime | None = None
 
     async def initialize(self):
         if self._task and not self._task.done():
             return
         self._session = aiohttp.ClientSession(headers={"User-Agent": DEFAULT_UA})
         self._http = BiliHttpClient(self._session)
+        cfg = self._load_config()
+        self._publish_runtime = PublishRuntime(
+            storage_root=cfg.storage_runtime_root,
+            session=self._session,
+            enabled_getter=self._publish_enabled_flag,
+            cookie_getter=self._publish_cookie_value,
+            ffmpeg_path_getter=self._publish_ffmpeg_path,
+            sanitize_error_message=self._sanitize_error_message,
+        )
+        await self._publish_runtime.start()
         self._task = asyncio.create_task(self._watch_loop(), name="bili-live-watcher")
         logger.info("[bili_watcher] initialized")
 
@@ -170,6 +218,9 @@ class BilibiliLiveWatcherPlugin(Star):
         self._cleanup_login_qrcode_image()
 
         await self._stop_runtime_clients()
+        if self._publish_runtime is not None:
+            await self._publish_runtime.stop()
+            self._publish_runtime = None
 
         if self._session and not self._session.closed:
             await self._session.close()
@@ -185,6 +236,7 @@ class BilibiliLiveWatcherPlugin(Star):
             "/biliwatch status - 查看当前运行状态、房间号、登录态和发送状态",
             "/biliwatch toggle [on|off] - 开启或关闭整个插件，不传参数时自动切换",
             "/biliwatch room <room_id> - 设置要监听的 B 站直播间号",
+            "/biliwatch record on|off|status - 控制直播录制与查看录制状态",
             "/biliwatch bind - 把当前会话绑定为 AstrBot 侧发送目标",
             "/biliwatch auto-reply [on|off] - 开启或关闭自动生成弹幕回复",
             "/biliwatch sync-live [on|off] - 开启或关闭同步发送到 B 站直播弹幕",
@@ -192,6 +244,23 @@ class BilibiliLiveWatcherPlugin(Star):
             "/biliwatch context-window <seconds> - 设置保留给融合和 prompt 的上下文窗口",
             "/biliwatch danmaku-threshold <count> - 设置触发前至少需要多少条弹幕",
             "/biliwatch asr-threshold <count> - 设置触发前至少需要多少条 ASR 语句",
+            "/biliwatch asr range <HH:MM:SS> <HH:MM:SS> - 查看时间范围内的 ASR 参考文本",
+            "/biliwatch clip range <HH:MM:SS> <HH:MM:SS> - 导出时间范围内的 clip",
+            "/biliwatch clip review list - 查看 AI 候选片段",
+            "/biliwatch clip review scan - 立即扫描一次 AI 候选片段",
+            "/biliwatch clip review asr <clip_id> - 查看候选片段范围内的 ASR 参考文本",
+            "/biliwatch clip review set-range <clip_id> <HH:MM:SS> <HH:MM:SS> - 调整候选片段时间范围",
+            "/biliwatch clip review approve <clip_id> - 确认候选片段",
+            "/biliwatch clip review reject <clip_id> - 拒绝候选片段",
+            "/biliwatch publish submit <clip_id> [title] - 为已导出的 clip 创建投稿草稿",
+            "/biliwatch publish update-title <job_id> <title> - 修改投稿草稿标题",
+            "/biliwatch publish update-desc <job_id> <desc> - 修改投稿草稿简介",
+            "/biliwatch publish update-tags <job_id> <tag1,tag2> - 修改投稿草稿标签",
+            "/biliwatch publish update-tid <job_id> <tid> - 修改投稿草稿分区",
+            "/biliwatch publish approve <job_id> - 人工确认后开始后台上传",
+            "/biliwatch publish list - 查看最近投稿作业",
+            "/biliwatch publish status <job_id> - 查看投稿作业状态",
+            "/biliwatch publish retry <job_id> - 重试失败或等待重试中的投稿作业",
             "/biliwatch login - 发起 B 站二维码登录（实验性）",
             "/biliwatch login status - 查看二维码登录进度和当前账号状态",
             "/biliwatch logout - 清除插件内保存的二维码登录态",
@@ -214,6 +283,15 @@ class BilibiliLiveWatcherPlugin(Star):
         ws_status = "disabled"
         if self._ws_client is not None:
             ws_status = f"connected={self._ws_client.connected} fatal={self._ws_client.fatal_error or '-'}"
+        recording_status = "disabled"
+        if self._recording_runtime is not None:
+            snapshot = self._recording_status_snapshot()
+            recording_status = (
+                f"running={snapshot['running']} session_id={snapshot['session_id']} "
+                f"segments={snapshot['segment_count']} last_segment={snapshot['last_segment_id'] or '-'} "
+                f"error={snapshot['last_error'] or '-'}"
+            )
+        timeline_session_id = self._timeline_runtime.session_id if self._timeline_runtime is not None else "-"
         account_status = await self._get_bili_account_status(cfg, refresh=False)
         yield event.plain_result(
             "\n".join(
@@ -222,6 +300,10 @@ class BilibiliLiveWatcherPlugin(Star):
                     f"debug: {cfg.debug}",
                     f"pipeline_mode: {cfg.pipeline_mode}",
                     f"room_id: {cfg.room_id}",
+                    f"recording_enabled: {cfg.recording_enabled}",
+                    f"recording_mode: {self._recording_mode_code(cfg.recording_mode)} ({cfg.recording_mode})",
+                    f"clip_ai_enabled: {cfg.clip_ai_enabled}",
+                    f"publish_enabled: {cfg.publish_enabled}",
                     f"auto_reply_enabled: {cfg.auto_reply_enabled}",
                     f"generation_provider_id: {cfg.generation_provider_id or '(default)'}",
                     f"generation_persona_id: {cfg.generation_persona_id or '(default)'}",
@@ -250,6 +332,11 @@ class BilibiliLiveWatcherPlugin(Star):
                     f"ws: {ws_status}",
                     f"asr: {asr_status}",
                     f"audio_task_running: {bool(self._audio_task and not self._audio_task.done())}",
+                    f"recording_runtime: {recording_status}",
+                    f"publish_runtime_running: {bool(self._publish_runtime is not None)}",
+                    f"timeline_session_id: {timeline_session_id}",
+                    f"recording_session_root: {self._last_recording_session_root or '-'}",
+                    f"last_clip_ai_scan: {self._format_timestamp(self._last_clip_ai_scan_ts)}",
                     f"last_trigger: {last_trigger}",
                 ]
             )
@@ -424,6 +511,417 @@ class BilibiliLiveWatcherPlugin(Star):
             example="/biliwatch asr-threshold 2",
         )
         yield event.plain_result(result)
+
+    @filter.command("biliwatch record")
+    async def biliwatch_record(self, event: AstrMessageEvent, action: str = ""):
+        raw = str(action or "").strip().lower()
+        if not raw:
+            parts = event.message_str.strip().split()
+            if len(parts) >= 3:
+                raw = parts[-1].strip().lower()
+
+        if raw == "status":
+            snapshot = self._recording_status_snapshot() if self._recording_runtime is not None else None
+            yield event.plain_result(
+                "\n".join(
+                    [
+                        f"recording_enabled: {self._load_config().recording_enabled}",
+                        (
+                            "recording_runtime: "
+                            f"running={snapshot['running']} session_id={snapshot['session_id']} "
+                            f"segments={snapshot['segment_count']} last_segment={snapshot['last_segment_id'] or '-'} "
+                            f"error={snapshot['last_error'] or '-'}"
+                            if snapshot is not None
+                            else "recording_runtime: disabled"
+                        ),
+                        f"recording_session_root: {self._last_recording_session_root or '-'}",
+                    ]
+                )
+            )
+            return
+
+        current = self._to_bool(self._config_get("global.recording_enabled", False), False)
+        if raw in ("on", "enable", "enabled", "true", "1", "开", "开启"):
+            new_value = True
+        elif raw in ("off", "disable", "disabled", "false", "0", "关", "关闭"):
+            new_value = False
+        else:
+            new_value = not current
+
+        self._set_config_value("global.recording_enabled", new_value)
+        saved = self._save_config_if_possible()
+        suffix = "（已保存）" if saved else "（运行时已生效，未持久化）"
+        state = "开启" if new_value else "关闭"
+        yield event.plain_result(f"已{state}直播录制 {suffix}")
+
+    @filter.command("biliwatch mark")
+    async def biliwatch_mark(self, event: AstrMessageEvent, label: str = ""):
+        clip = await self._export_manual_clip(
+            source="manual_mark",
+            center_wall_ts=time.time(),
+            pre_seconds=DEFAULT_MARK_PRE_SECONDS,
+            post_seconds=DEFAULT_MARK_POST_SECONDS,
+            label=str(label or "").strip(),
+            create_marker=True,
+        )
+        yield event.plain_result(clip)
+
+    @filter.command("biliwatch clip last")
+    async def biliwatch_clip_last(self, event: AstrMessageEvent, seconds: str = ""):
+        raw = str(seconds or "").strip()
+        if not raw:
+            parts = event.message_str.strip().split()
+            if len(parts) >= 4:
+                raw = parts[-1].strip()
+        try:
+            seconds_value = max(1, int(raw))
+        except Exception:
+            yield event.plain_result("clip 时长无效，请输入正整数。例如：/biliwatch clip last 30")
+            return
+        if not self._is_clip_duration_allowed(seconds_value):
+            yield event.plain_result(self._build_clip_duration_error())
+            return
+        clip = await self._export_manual_clip(
+            source="manual_last",
+            last_seconds=seconds_value,
+        )
+        yield event.plain_result(clip)
+
+    @filter.command("biliwatch clip around")
+    async def biliwatch_clip_around(self, event: AstrMessageEvent, pre: str = "", post: str = ""):
+        parts = event.message_str.strip().split()
+        raw_pre = str(pre or "").strip() or (parts[3].strip() if len(parts) >= 4 else "")
+        raw_post = str(post or "").strip() or (parts[4].strip() if len(parts) >= 5 else "")
+        try:
+            pre_seconds = max(0, int(raw_pre))
+            post_seconds = max(0, int(raw_post))
+        except Exception:
+            yield event.plain_result("clip 窗口无效，请输入两个整数。例如：/biliwatch clip around 60 120")
+            return
+        duration = pre_seconds + post_seconds
+        if not self._is_clip_duration_allowed(duration):
+            yield event.plain_result(self._build_clip_duration_error())
+            return
+        clip = await self._export_manual_clip(
+            source="manual_around",
+            center_wall_ts=time.time(),
+            pre_seconds=pre_seconds,
+            post_seconds=post_seconds,
+        )
+        yield event.plain_result(clip)
+
+    @filter.command("biliwatch asr range")
+    async def biliwatch_asr_range(self, event: AstrMessageEvent, start: str = "", end: str = ""):
+        start_text, end_text = self._extract_tail_args(event, [start, end], min_parts=5, count=2)
+        if not start_text or not end_text:
+            yield event.plain_result("缺少时间范围。例如：/biliwatch asr range 00:10:00 00:12:30")
+            return
+        yield event.plain_result(self._render_asr_reference_by_range(start_text, end_text))
+
+    @filter.command("biliwatch clip range")
+    async def biliwatch_clip_range(self, event: AstrMessageEvent, start: str = "", end: str = ""):
+        start_text, end_text = self._extract_tail_args(event, [start, end], min_parts=5, count=2)
+        if not start_text or not end_text:
+            yield event.plain_result("缺少时间范围。例如：/biliwatch clip range 00:10:00 00:12:30")
+            return
+        yield event.plain_result(
+            await self._export_manual_clip_by_range(
+                start_text=start_text,
+                end_text=end_text,
+                source="manual_range",
+            )
+        )
+
+    @filter.command("biliwatch clip review list")
+    async def biliwatch_clip_review_list(self, event: AstrMessageEvent):
+        store = self._current_candidate_store()
+        if store is None:
+            yield event.plain_result("没有可用的录制会话，请先开启录制并等待 timeline 数据积累。")
+            return
+        rows = store.list_candidates()
+        if not rows:
+            yield event.plain_result("当前没有 AI 候选片段。可用 /biliwatch clip review scan 主动刷新。")
+            return
+        lines = []
+        for item in rows[:20]:
+            lines.append(
+                f"{item['candidate_id']} [{item.get('candidate_type','-')}] "
+                f"state={item.get('state','pending')} "
+                f"time={self._format_candidate_time_range(item)} "
+                f"topic={item.get('topic','-')} "
+                f"summary={str(item.get('summary', '') or '-').strip() or '-'}"
+            )
+        yield event.plain_result("\n".join(lines))
+
+    @filter.command("biliwatch clip review scan")
+    async def biliwatch_clip_review_scan(self, event: AstrMessageEvent):
+        cfg = self._load_config()
+        rows = await self._scan_ai_candidates(cfg, force=True)
+        if not rows:
+            yield event.plain_result("扫描完成，但当前没有新的 AI 候选片段。")
+            return
+        lines = []
+        for item in rows[:20]:
+            lines.append(
+                f"{item['candidate_id']} [{item.get('candidate_type','-')}] "
+                f"state={item.get('state','pending')} "
+                f"time={self._format_candidate_time_range(item)} "
+                f"topic={item.get('topic','-')} "
+                f"summary={str(item.get('summary', '') or '-').strip() or '-'}"
+            )
+        yield event.plain_result("\n".join(lines))
+
+    @filter.command("biliwatch clip review asr")
+    async def biliwatch_clip_review_asr(self, event: AstrMessageEvent, clip_id: str = ""):
+        target_id = self._extract_tail_arg(event, clip_id, min_parts=5)
+        if not target_id:
+            yield event.plain_result("缺少 clip_id。例如：/biliwatch clip review asr clip-xxxx")
+            return
+        yield event.plain_result(self._render_candidate_asr_reference(target_id))
+
+    @filter.command("biliwatch clip review set-range")
+    async def biliwatch_clip_review_set_range(
+        self,
+        event: AstrMessageEvent,
+        clip_id: str = "",
+        start: str = "",
+        end: str = "",
+    ):
+        target_id, start_text, end_text = self._extract_tail_args(
+            event,
+            [clip_id, start, end],
+            min_parts=6,
+            count=3,
+        )
+        if not target_id or not start_text or not end_text:
+            yield event.plain_result(
+                "缺少参数。例如：/biliwatch clip review set-range clip-xxxx 00:10:00 00:12:30"
+            )
+            return
+        yield event.plain_result(self._update_candidate_range(target_id, start_text, end_text))
+
+    @filter.command("biliwatch clip review approve")
+    async def biliwatch_clip_review_approve(self, event: AstrMessageEvent, clip_id: str = ""):
+        target_id = self._extract_tail_arg(event, clip_id, min_parts=5)
+        if not target_id:
+            yield event.plain_result("缺少 clip_id。例如：/biliwatch clip review approve hot-xxxx")
+            return
+        store = self._current_candidate_store()
+        if store is None:
+            yield event.plain_result("没有可用的录制会话，请先开启录制。")
+            return
+        try:
+            updated = store.update_state(target_id, "approved")
+        except KeyError:
+            yield event.plain_result(f"找不到候选片段：{target_id}")
+            return
+        result = (
+            f"candidate_id={updated['candidate_id']} "
+            f"state={updated['state']} "
+            f"time={self._format_candidate_time_range(updated)} "
+            f"topic={updated.get('topic', '-')}"
+        )
+        export_result = await self._export_candidate_clip(target_id)
+        result = f"{result}\n{export_result}"
+        yield event.plain_result(result)
+
+    @filter.command("biliwatch clip review reject")
+    async def biliwatch_clip_review_reject(self, event: AstrMessageEvent, clip_id: str = ""):
+        result = self._update_candidate_state_from_command(
+            event,
+            explicit_clip_id=clip_id,
+            new_state="rejected",
+            example="/biliwatch clip review reject hot-xxxx",
+        )
+        yield event.plain_result(result)
+
+    @filter.command("biliwatch publish submit")
+    async def biliwatch_publish_submit(self, event: AstrMessageEvent, clip_id: str = "", title: str = ""):
+        cfg = self._load_config()
+        if not cfg.publish_enabled:
+            yield event.plain_result("投稿功能未启用。请先在 publish.enabled 中开启。")
+            return
+        if self._publish_runtime is None:
+            yield event.plain_result("投稿 runtime 未初始化，请稍后重试。")
+            return
+        target_clip_id, resolved_title = self._parse_publish_submit_command(event, clip_id=clip_id, title=title)
+        if not target_clip_id:
+            yield event.plain_result("缺少 clip_id。例如：/biliwatch publish submit clip-xxxx 可选标题")
+            return
+        clip_row = find_clip_by_id(cfg.storage_runtime_root, target_clip_id)
+        if clip_row is None:
+            yield event.plain_result(f"找不到已导出的 clip：{target_clip_id}")
+            return
+        try:
+            draft = build_publish_draft(
+                clip_row=clip_row,
+                title_template=cfg.publish_title_template,
+                desc_template=cfg.publish_desc_template,
+                default_tid=cfg.publish_default_tid,
+                default_tags=cfg.publish_default_tags,
+                visibility=cfg.publish_default_visibility,
+                explicit_title=resolved_title,
+            )
+            job, duplicate = await self._publish_runtime.submit(
+                draft,
+                max_retries=cfg.publish_max_retries,
+                retry_backoff_seconds=cfg.publish_retry_backoff_seconds,
+                use_tid_predict=cfg.publish_use_tid_predict,
+                use_tag_recommendation=cfg.publish_use_tag_recommendation,
+                cover_strategy=cfg.publish_cover_strategy,
+            )
+        except Exception as exc:
+            yield event.plain_result(f"创建投稿作业失败：{self._sanitize_error_message(exc)}")
+            return
+        if duplicate is not None:
+            yield event.plain_result(
+                f"该 clip 已存在投稿作业：job_id={duplicate.job_id} state={duplicate.state}"
+            )
+            return
+        yield event.plain_result(
+            "\n".join(
+                [
+                    f"job_id={job.job_id}",
+                    f"state={job.state}",
+                    f"clip_id={job.clip_id}",
+                    f"title={job.title}",
+                    f"desc={job.desc or '-'}",
+                    f"tags={','.join(job.tags) if job.tags else '-'}",
+                    "说明：这是投稿草稿。请先检查并按需修改，再执行 /biliwatch publish approve 开始后台上传。",
+                ]
+            )
+        )
+
+    @filter.command("biliwatch publish update-title")
+    async def biliwatch_publish_update_title(self, event: AstrMessageEvent, job_id: str = "", title: str = ""):
+        yield event.plain_result(
+            await self._update_publish_draft_field(
+                event,
+                job_id=job_id,
+                raw_value=title,
+                field_name="title",
+                min_parts=5,
+            )
+        )
+
+    @filter.command("biliwatch publish update-desc")
+    async def biliwatch_publish_update_desc(self, event: AstrMessageEvent, job_id: str = "", desc: str = ""):
+        yield event.plain_result(
+            await self._update_publish_draft_field(
+                event,
+                job_id=job_id,
+                raw_value=desc,
+                field_name="desc",
+                min_parts=5,
+            )
+        )
+
+    @filter.command("biliwatch publish update-tags")
+    async def biliwatch_publish_update_tags(self, event: AstrMessageEvent, job_id: str = "", tags: str = ""):
+        yield event.plain_result(
+            await self._update_publish_draft_field(
+                event,
+                job_id=job_id,
+                raw_value=tags,
+                field_name="tags",
+                min_parts=5,
+            )
+        )
+
+    @filter.command("biliwatch publish update-tid")
+    async def biliwatch_publish_update_tid(self, event: AstrMessageEvent, job_id: str = "", tid: str = ""):
+        yield event.plain_result(
+            await self._update_publish_draft_field(
+                event,
+                job_id=job_id,
+                raw_value=tid,
+                field_name="tid",
+                min_parts=5,
+            )
+        )
+
+    @filter.command("biliwatch publish approve")
+    async def biliwatch_publish_approve(self, event: AstrMessageEvent, job_id: str = ""):
+        cfg = self._load_config()
+        if not cfg.publish_enabled:
+            yield event.plain_result("投稿功能未启用。请先在 publish.enabled 中开启。")
+            return
+        if self._publish_runtime is None:
+            yield event.plain_result("投稿 runtime 未初始化，请稍后重试。")
+            return
+        target_id = self._extract_tail_arg(event, job_id, min_parts=4)
+        if not target_id:
+            yield event.plain_result("缺少 job_id。例如：/biliwatch publish approve pub-xxxx")
+            return
+        try:
+            job = await self._publish_runtime.approve(target_id)
+        except KeyError:
+            yield event.plain_result(f"找不到投稿作业：{target_id}")
+            return
+        except ValueError as exc:
+            yield event.plain_result(str(exc))
+            return
+        yield event.plain_result(f"已开始后台上传：job_id={job.job_id} state={job.state}")
+
+    @filter.command("biliwatch publish list")
+    async def biliwatch_publish_list(self, event: AstrMessageEvent):
+        cfg = self._load_config()
+        if not cfg.publish_enabled:
+            yield event.plain_result("投稿功能未启用。请先在 publish.enabled 中开启。")
+            return
+        if self._publish_runtime is None:
+            yield event.plain_result("投稿 runtime 未初始化，请稍后重试。")
+            return
+        jobs = self._publish_runtime.list_jobs(limit=10)
+        if not jobs:
+            yield event.plain_result("当前没有投稿作业。")
+            return
+        lines = ["最近投稿作业："]
+        for job in jobs:
+            lines.append(self._format_publish_job_brief(job))
+        yield event.plain_result("\n".join(lines))
+
+    @filter.command("biliwatch publish status")
+    async def biliwatch_publish_status(self, event: AstrMessageEvent, job_id: str = ""):
+        cfg = self._load_config()
+        if not cfg.publish_enabled:
+            yield event.plain_result("投稿功能未启用。请先在 publish.enabled 中开启。")
+            return
+        if self._publish_runtime is None:
+            yield event.plain_result("投稿 runtime 未初始化，请稍后重试。")
+            return
+        target_id = self._extract_tail_arg(event, job_id, min_parts=4)
+        if not target_id:
+            yield event.plain_result("缺少 job_id。例如：/biliwatch publish status pub-xxxx")
+            return
+        job = self._publish_runtime.get_job(target_id)
+        if job is None:
+            yield event.plain_result(f"找不到投稿作业：{target_id}")
+            return
+        yield event.plain_result(self._format_publish_job_detail(job))
+
+    @filter.command("biliwatch publish retry")
+    async def biliwatch_publish_retry(self, event: AstrMessageEvent, job_id: str = ""):
+        cfg = self._load_config()
+        if not cfg.publish_enabled:
+            yield event.plain_result("投稿功能未启用。请先在 publish.enabled 中开启。")
+            return
+        if self._publish_runtime is None:
+            yield event.plain_result("投稿 runtime 未初始化，请稍后重试。")
+            return
+        target_id = self._extract_tail_arg(event, job_id, min_parts=4)
+        if not target_id:
+            yield event.plain_result("缺少 job_id。例如：/biliwatch publish retry pub-xxxx")
+            return
+        try:
+            job = await self._publish_runtime.retry(target_id)
+        except KeyError:
+            yield event.plain_result(f"找不到投稿作业：{target_id}")
+            return
+        except ValueError as exc:
+            yield event.plain_result(str(exc))
+            return
+        yield event.plain_result(f"已重新入队：job_id={job.job_id} state={job.state}")
 
     @filter.command("biliwatch login")
     async def biliwatch_login(self, event: AstrMessageEvent, action: str = ""):
@@ -747,7 +1245,13 @@ class BilibiliLiveWatcherPlugin(Star):
             return
 
         room_id = await self._resolve_real_room_id(cfg.room_id, cfg.bilibili_cookie)
-        await self._ensure_runtime(cfg, room_id)
+        room_meta = await self._get_room_prompt_meta(room_id=room_id, cookie=cfg.bilibili_cookie, force_refresh=True)
+        if self._normalize_live_status(room_meta.get("live_status")) != "直播中":
+            await self._stop_runtime_clients()
+            self._prune_old(cfg.context_window_seconds)
+            return
+        await self._ensure_runtime(cfg, room_id, room_meta=room_meta)
+        await self._maybe_scan_ai_candidates(cfg)
 
         self._prune_old(cfg.context_window_seconds)
         if not cfg.auto_reply_enabled:
@@ -789,7 +1293,7 @@ class BilibiliLiveWatcherPlugin(Star):
             reply=reply,
         )
 
-    async def _ensure_runtime(self, cfg: WatchConfig, room_id: int):
+    async def _ensure_runtime(self, cfg: WatchConfig, room_id: int, *, room_meta: dict[str, object]):
         if self._runtime_room_id != room_id:
             await self._stop_runtime_clients()
             self._runtime_room_id = room_id
@@ -799,10 +1303,119 @@ class BilibiliLiveWatcherPlugin(Star):
             self._history_bootstrapped = False
             self._room_prompt_meta_room_id = None
             self._room_prompt_meta = {}
+            self._room_prompt_meta_ts = 0.0
 
+        await self._ensure_recording_runtime(cfg, room_id, room_meta=room_meta)
+        await self._ensure_timeline_runtime(cfg)
+        self._sync_active_session_metadata(cfg=cfg, room_id=room_id, room_meta=room_meta)
         await self._ensure_ws_runtime(cfg, room_id)
         await self._ensure_history_runtime(room_id)
         await self._ensure_audio_runtime(cfg, room_id)
+
+    async def _ensure_recording_runtime(self, cfg: WatchConfig, room_id: int, *, room_meta: dict[str, object]):
+        if self._http is None:
+            return
+        if not cfg.recording_enabled:
+            await self._stop_recording_runtime()
+            return
+
+        recording_key = (
+            room_id,
+            cfg.recording_enabled,
+            cfg.recording_mode,
+            cfg.storage_runtime_root,
+            cfg.ffmpeg_path,
+            cfg.recording_segment_duration_seconds,
+            cfg.recording_output_container,
+            cfg.audio_pull_protocol,
+            cfg.audio_pull_api_preference,
+            cfg.bilibili_cookie,
+            cfg.recording_max_session_hours,
+        )
+        if (
+            self._recording_runtime is not None
+            and self._recording_runtime_key == recording_key
+            and self._recording_runtime.running
+        ):
+            return
+
+        await self._stop_recording_runtime()
+        runtime = LiveRecorderRuntime(
+            http_client=self._http,
+            room_id=cfg.room_id,
+            real_room_id=room_id,
+            output_root=cfg.storage_runtime_root,
+            ffmpeg_path=cfg.ffmpeg_path,
+            segment_duration_seconds=cfg.recording_segment_duration_seconds,
+            output_container=cfg.recording_output_container,
+            pull_protocol=cfg.audio_pull_protocol,
+            api_preference=cfg.audio_pull_api_preference,
+            cookie=cfg.bilibili_cookie,
+            audio_http_headers_enabled=cfg.audio_http_headers_enabled,
+            max_session_hours=cfg.recording_max_session_hours,
+            session_extra=self._build_session_submission_metadata(cfg=cfg, room_id=room_id, room_meta=room_meta),
+            on_segment=self._on_recording_segment,
+        )
+        runtime.start()
+        self._recording_runtime = runtime
+        self._recording_runtime_key = recording_key
+        self._active_session_layout = runtime.layout
+        self._active_session_id = runtime.session_id
+        self._last_recording_session_root = str(runtime.layout.root)
+
+    def _build_session_submission_metadata(
+        self,
+        *,
+        cfg: WatchConfig,
+        room_id: int,
+        room_meta: dict[str, object] | None,
+    ) -> dict[str, object]:
+        meta = dict(room_meta or {})
+        now = time.time()
+        return {
+            "room_id": int(cfg.room_id or 0),
+            "real_room_id": int(room_id or 0),
+            "anchor_name": str(meta.get("anchor_name", "") or "").strip(),
+            "room_title": str(meta.get("room_title", "") or "").strip(),
+            "session_date": time.strftime("%Y-%m-%d", time.localtime(now)),
+            "metadata_updated_at": now,
+        }
+
+    def _sync_active_session_metadata(
+        self,
+        *,
+        cfg: WatchConfig,
+        room_id: int,
+        room_meta: dict[str, object] | None,
+    ) -> None:
+        session_root = str(self._last_recording_session_root or "").strip()
+        if not session_root:
+            return
+        try:
+            existing = load_session_index(session_root)
+            payload = self._build_session_submission_metadata(cfg=cfg, room_id=room_id, room_meta=room_meta)
+            if str(existing.get("session_date", "") or "").strip():
+                payload["session_date"] = str(existing.get("session_date", "") or "").strip()
+            update_session_index(
+                session_root,
+                **payload,
+            )
+        except Exception as exc:
+            logger.warning("[bili_watcher] update session metadata failed: %s", exc)
+
+    async def _ensure_timeline_runtime(self, cfg: WatchConfig):
+        index_enabled = cfg.recording_enabled and cfg.recording_mode != "record_only"
+        if not index_enabled or self._active_session_layout is None:
+            await self._stop_timeline_runtime()
+            return
+        timeline_key = (self._active_session_id, self._active_session_layout.root)
+        if self._timeline_runtime is not None and self._timeline_runtime_key == timeline_key:
+            return
+        self._timeline_runtime = TimelineIndexerRuntime(
+            session_root=self._active_session_layout.root,
+            session_id=self._active_session_id,
+        )
+        self._timeline_runtime_key = timeline_key
 
     async def _ensure_history_runtime(self, room_id: int):
         if self._history_task and not self._history_task.done():
@@ -902,6 +1515,22 @@ class BilibiliLiveWatcherPlugin(Star):
         await self._stop_history_runtime()
         await self._stop_ws_runtime()
         await self._stop_audio_runtime()
+        await self._stop_recording_runtime()
+        await self._stop_timeline_runtime()
+
+    async def _stop_recording_runtime(self):
+        if self._recording_runtime is not None:
+            await self._recording_runtime.stop()
+        self._recording_runtime = None
+        self._recording_runtime_key = None
+        self._active_session_layout = None
+        self._active_session_id = ""
+
+    async def _stop_timeline_runtime(self):
+        if self._timeline_runtime is not None:
+            self._timeline_runtime.flush()
+        self._timeline_runtime = None
+        self._timeline_runtime_key = None
 
     async def _stop_history_runtime(self):
         if self._history_task is not None:
@@ -1041,6 +1670,602 @@ class BilibiliLiveWatcherPlugin(Star):
             self._record_asr_segment(seg)
             self._debug_log_asr_segment(seg)
 
+    def _recording_status_snapshot(self) -> dict[str, object]:
+        runtime = self._recording_runtime
+        if runtime is None:
+            return {
+                "running": False,
+                "session_id": "",
+                "segment_count": 0,
+                "last_segment_id": "",
+                "last_error": "",
+            }
+        snapshot = getattr(runtime, "status_snapshot", None)
+        if callable(snapshot):
+            return snapshot()
+        return {
+            "running": bool(getattr(runtime, "running", False)),
+            "session_id": str(getattr(runtime, "session_id", "") or ""),
+            "segment_count": int(getattr(runtime, "segment_count", 0) or 0),
+            "last_segment_id": str(getattr(runtime, "last_segment_id", "") or ""),
+            "last_error": str(getattr(runtime, "last_error", "") or ""),
+        }
+
+    async def _on_recording_segment(self, segment) -> None:
+        if self._timeline_runtime is None:
+            return
+        self._timeline_runtime.append_recording_segment(
+            segment_id=segment.segment_id,
+            file_path=segment.file_path,
+            wall_ts_start=segment.wall_ts_start,
+            wall_ts_end=segment.wall_ts_end,
+            ok=segment.ok,
+            error=segment.error,
+        )
+
+    async def _export_manual_clip(
+        self,
+        *,
+        source: str,
+        center_wall_ts: float | None = None,
+        pre_seconds: int | None = None,
+        post_seconds: int | None = None,
+        last_seconds: int | None = None,
+        label: str = "",
+        create_marker: bool = False,
+    ) -> str:
+        cfg = self._load_config()
+        session_root = self._last_recording_session_root
+        if not session_root:
+            return "没有可用的录制会话，请先开启 `/biliwatch record on` 并等待生成分段。"
+        if not cfg.recording_enabled:
+            return "当前未启用录制，请先执行 `/biliwatch record on`。"
+        try:
+            exporter = ClipExporterRuntime(
+                session_root=session_root,
+                ffmpeg_path=cfg.ffmpeg_path,
+                output_container="mp4",
+            )
+            marker_id = ""
+            if create_marker and self._timeline_runtime is not None:
+                marker_id = time.strftime("marker-%Y%m%d-%H%M%S", time.localtime())
+                self._timeline_runtime.append_marker(
+                    marker_id=marker_id,
+                    wall_ts=center_wall_ts or time.time(),
+                    label=label,
+                )
+            if last_seconds is not None:
+                clip = await exporter.export_last_seconds(
+                    seconds=last_seconds,
+                    source=source,
+                    build_srt=False,
+                    label=label,
+                    marker_id=marker_id,
+                )
+            else:
+                clip = await exporter.export_around_timestamp(
+                    center_wall_ts=center_wall_ts or time.time(),
+                    pre_seconds=pre_seconds or 0,
+                    post_seconds=post_seconds or 0,
+                    source=source,
+                    build_srt=False,
+                    label=label,
+                    marker_id=marker_id,
+                )
+            return (
+                f"clip_id={clip['clip_id']}\n"
+                f"output={clip['output_path']}\n"
+                f"duration_seconds={clip['duration_seconds']:.1f}"
+            )
+        except Exception as exc:
+            return self._format_clip_export_error(exc)
+
+    def _is_clip_duration_allowed(self, duration_seconds: int) -> bool:
+        return DEFAULT_CLIP_MIN_DURATION_SECONDS <= duration_seconds <= DEFAULT_CLIP_MAX_DURATION_SECONDS
+
+    def _build_clip_duration_error(self) -> str:
+        return (
+            "clip 时长超出允许范围，"
+            f"当前限制为 {DEFAULT_CLIP_MIN_DURATION_SECONDS}-{DEFAULT_CLIP_MAX_DURATION_SECONDS} 秒。"
+        )
+
+    async def _maybe_scan_ai_candidates(self, cfg: WatchConfig) -> None:
+        await self._scan_ai_candidates(cfg, force=False)
+
+    async def _scan_ai_candidates(self, cfg: WatchConfig, *, force: bool) -> list[dict]:
+        if not cfg.recording_enabled:
+            return []
+        if cfg.recording_mode != "record_index_and_ai_clips":
+            return []
+        if not cfg.clip_ai_enabled:
+            return []
+        if not self._last_recording_session_root:
+            return []
+        now = time.time()
+        if (not force) and (now - self._last_clip_ai_scan_ts) < max(5, cfg.context_window_seconds):
+            store = self._current_candidate_store()
+            return store.list_candidates() if store is not None else []
+        room_meta = await self._get_room_prompt_meta(
+            room_id=self._runtime_room_id or cfg.room_id,
+            cookie=cfg.bilibili_cookie,
+        )
+        if self._normalize_live_status(room_meta.get("live_status")) != "直播中":
+            store = self._current_candidate_store()
+            return store.list_candidates() if store is not None else []
+        planner = ClipPlannerRuntime(session_root=self._last_recording_session_root)
+        if (now - planner.session_started_at) < max(1, cfg.context_window_seconds):
+            store = self._current_candidate_store()
+            return store.list_candidates() if store is not None else []
+        scan_window = planner.build_scan_window(
+            window_seconds=cfg.context_window_seconds,
+            now_wall_ts=now,
+        )
+        if not scan_window.get("ordered_context"):
+            self._last_clip_ai_scan_ts = now
+            return planner.store.list_candidates()
+        target_umo = self._resolve_target_umo(cfg)
+        provider = await self._resolve_provider(cfg=cfg, target_umo=target_umo)
+        if provider is None:
+            self._last_clip_ai_scan_ts = now
+            return planner.store.list_candidates()
+        prompt = planner.build_scan_prompt(
+            room_id=self._runtime_room_id or cfg.room_id,
+            room_title=str(room_meta.get("room_title", "") or ""),
+            anchor_name=str(room_meta.get("anchor_name", "") or ""),
+            scan_window=scan_window,
+            prompt_template=cfg.clip_ai_prompt_template,
+        )
+        text = await self._run_generation_once(
+            provider=provider,
+            prompt=prompt,
+            contexts=[],
+            system_prompt="",
+        )
+        rows = planner.merge_response_candidate(
+            response_text=text,
+            scan_window=scan_window,
+        )
+        self._last_clip_ai_scan_ts = now
+        return rows
+
+    def _current_candidate_store(self) -> ClipCandidateStore | None:
+        if not self._last_recording_session_root:
+            return None
+        return ClipCandidateStore(session_root=self._last_recording_session_root)
+
+    def _current_session_root_path(self) -> Path | None:
+        raw = str(self._last_recording_session_root or "").strip()
+        if not raw:
+            return None
+        return Path(raw).expanduser().resolve()
+
+    def _extract_tail_arg(self, event: AstrMessageEvent, explicit_value: str, *, min_parts: int) -> str:
+        raw = str(explicit_value or "").strip()
+        if raw:
+            return raw
+        parts = str(getattr(event, "message_str", "") or "").strip().split()
+        if len(parts) >= min_parts:
+            return parts[-1].strip()
+        return ""
+
+    def _extract_tail_args(
+        self,
+        event: AstrMessageEvent,
+        explicit_values: list[str],
+        *,
+        min_parts: int,
+        count: int,
+    ) -> tuple[str, ...]:
+        cleaned = [str(value or "").strip() for value in list(explicit_values or [])[:count]]
+        parts = str(getattr(event, "message_str", "") or "").strip().split()
+        tail = parts[-count:] if len(parts) >= min_parts else []
+        resolved: list[str] = []
+        for index in range(count):
+            explicit = cleaned[index] if index < len(cleaned) else ""
+            resolved.append(explicit or (tail[index].strip() if len(tail) == count else ""))
+        return tuple(resolved)
+
+    def _parse_publish_submit_command(
+        self,
+        event: AstrMessageEvent,
+        *,
+        clip_id: str,
+        title: str,
+    ) -> tuple[str, str]:
+        raw_clip_id = str(clip_id or "").strip()
+        raw_title = str(title or "").strip()
+        message = str(getattr(event, "message_str", "") or "").strip()
+        prefix = "/biliwatch publish submit"
+        if message.startswith(prefix):
+            tail = message[len(prefix) :].strip()
+            if tail:
+                parts = tail.split(maxsplit=1)
+                if not raw_clip_id:
+                    raw_clip_id = parts[0].strip()
+                if len(parts) > 1:
+                    raw_title = parts[1].strip()
+        return raw_clip_id, raw_title
+
+    def _parse_publish_edit_command(
+        self,
+        event: AstrMessageEvent,
+        *,
+        command_prefix: str,
+        job_id: str,
+        raw_value: str,
+    ) -> tuple[str, str]:
+        resolved_job_id = str(job_id or "").strip()
+        resolved_value = str(raw_value or "").strip()
+        message = str(getattr(event, "message_str", "") or "").strip()
+        if message.startswith(command_prefix):
+            tail = message[len(command_prefix) :].strip()
+            if tail:
+                parts = tail.split(maxsplit=1)
+                if not resolved_job_id:
+                    resolved_job_id = parts[0].strip()
+                if len(parts) > 1 and not resolved_value:
+                    resolved_value = parts[1].strip()
+        return resolved_job_id, resolved_value
+
+    async def _update_publish_draft_field(
+        self,
+        event: AstrMessageEvent,
+        *,
+        job_id: str,
+        raw_value: str,
+        field_name: str,
+        min_parts: int,
+    ) -> str:
+        cfg = self._load_config()
+        if not cfg.publish_enabled:
+            return "投稿功能未启用。请先在 publish.enabled 中开启。"
+        if self._publish_runtime is None:
+            return "投稿 runtime 未初始化，请稍后重试。"
+        command_prefix = f"/biliwatch publish update-{field_name}"
+        target_id, value = self._parse_publish_edit_command(
+            event,
+            command_prefix=command_prefix,
+            job_id=job_id,
+            raw_value=raw_value,
+        )
+        if not target_id:
+            return f"缺少 job_id。例如：{command_prefix} pub-xxxx ..."
+        if not value:
+            return f"缺少要更新的值。例如：{command_prefix} {target_id} ..."
+        try:
+            if field_name == "title":
+                job = await self._publish_runtime.update_draft(target_id, title=value)
+            elif field_name == "desc":
+                job = await self._publish_runtime.update_draft(target_id, desc=value)
+            elif field_name == "tags":
+                job = await self._publish_runtime.update_draft(target_id, tags=self._to_string_list(value, []))
+            elif field_name == "tid":
+                try:
+                    parsed_tid = int(value)
+                    if parsed_tid < 0:
+                        raise ValueError
+                except Exception:
+                    return "tid 无效，请输入 0 或更大的整数。"
+                job = await self._publish_runtime.update_draft(target_id, tid=parsed_tid)
+            else:
+                return "unsupported_field"
+        except KeyError:
+            return f"找不到投稿作业：{target_id}"
+        except ValueError as exc:
+            return str(exc)
+        return self._format_publish_job_detail(job)
+
+    def _format_publish_job_brief(self, job: PublishJob) -> str:
+        suffix = f" bvid={job.bvid}" if job.bvid else ""
+        error = f" error={job.last_error}" if job.last_error else ""
+        return (
+            f"{job.job_id} state={job.state} clip_id={job.clip_id} "
+            f"retry={job.retry_count}/{job.max_retries}{suffix}{error}"
+        )
+
+    def _format_publish_job_detail(self, job: PublishJob) -> str:
+        lines = [
+            f"job_id={job.job_id}",
+            f"state={job.state}",
+            f"clip_id={job.clip_id}",
+            f"session_id={job.session_id}",
+            f"title={job.title}",
+            f"desc={job.desc or '-'}",
+            f"tid={job.tid}",
+            f"tags={','.join(job.tags) if job.tags else '-'}",
+            f"visibility={job.visibility}",
+            f"retry_count={job.retry_count}/{job.max_retries}",
+            f"last_error={job.last_error or '-'}",
+            f"aid={job.aid or '-'}",
+            f"bvid={job.bvid or '-'}",
+            f"archive_url={job.archive_url or '-'}",
+            f"created_at={self._format_timestamp(job.created_at)}",
+            f"updated_at={self._format_timestamp(job.updated_at)}",
+        ]
+        return "\n".join(lines)
+
+    def _publish_enabled_flag(self) -> bool:
+        return self._load_config().publish_enabled
+
+    def _publish_cookie_value(self) -> str:
+        return self._load_config().bilibili_cookie
+
+    def _publish_ffmpeg_path(self) -> str:
+        return self._load_config().ffmpeg_path
+
+    def _parse_session_time_range(
+        self,
+        start_text: str,
+        end_text: str,
+        *,
+        enforce_clip_duration: bool,
+    ) -> tuple[Path, float, float]:
+        session_root = self._current_session_root_path()
+        if session_root is None:
+            raise RuntimeError("没有可用的录制会话，请先开启录制并等待生成 session。")
+        start_wall_ts, end_wall_ts = resolve_range_to_wall_ts(session_root, start_text, end_text)
+        if enforce_clip_duration:
+            duration_seconds = int(round(end_wall_ts - start_wall_ts))
+            if not self._is_clip_duration_allowed(duration_seconds):
+                raise ValueError(self._build_clip_duration_error())
+        return session_root, start_wall_ts, end_wall_ts
+
+    def _format_candidate_time_range(self, candidate: dict[str, object]) -> str:
+        session_root = self._current_session_root_path()
+        start_wall_ts = float(candidate.get("clip_start_wall_ts", 0.0) or 0.0)
+        end_wall_ts = float(candidate.get("clip_end_wall_ts", 0.0) or 0.0)
+        if session_root is None:
+            return f"{start_wall_ts:.0f}-{end_wall_ts:.0f}"
+        try:
+            return f"{wall_ts_to_hhmmss(session_root, start_wall_ts)}-{wall_ts_to_hhmmss(session_root, end_wall_ts)}"
+        except Exception:
+            return f"{start_wall_ts:.0f}-{end_wall_ts:.0f}"
+
+    def _format_asr_reference_rows(
+        self,
+        session_root: Path,
+        *,
+        start_wall_ts: float,
+        end_wall_ts: float,
+        rows: list[dict],
+    ) -> str:
+        header = (
+            f"range={wall_ts_to_hhmmss(session_root, start_wall_ts)}-{wall_ts_to_hhmmss(session_root, end_wall_ts)}"
+        )
+        if not rows:
+            return f"{header}\n该时间范围内没有 ASR 参考文本。"
+        lines = [header]
+        for item in rows[:120]:
+            text = str(item.get("text", "") or "").strip()
+            if not text:
+                continue
+            lines.append(
+                f"[{wall_ts_to_hhmmss(session_root, float(item.get('wall_ts_start', 0.0) or 0.0))}"
+                f"-{wall_ts_to_hhmmss(session_root, float(item.get('wall_ts_end', 0.0) or 0.0))}] {text}"
+            )
+        if len(rows) > 120:
+            lines.append(f"... 共 {len(rows)} 条，仅显示前 120 条")
+        return "\n".join(lines)
+
+    def _render_asr_reference_by_range(self, start_text: str, end_text: str) -> str:
+        try:
+            session_root, start_wall_ts, end_wall_ts = self._parse_session_time_range(
+                start_text,
+                end_text,
+                enforce_clip_duration=False,
+            )
+        except (RuntimeError, ValueError) as exc:
+            return str(exc)
+        rows = query_asr_range(
+            session_root,
+            start_wall_ts=start_wall_ts,
+            end_wall_ts=end_wall_ts,
+        )
+        return self._format_asr_reference_rows(
+            session_root,
+            start_wall_ts=start_wall_ts,
+            end_wall_ts=end_wall_ts,
+            rows=rows,
+        )
+
+    def _render_candidate_asr_reference(self, candidate_id: str) -> str:
+        store = self._current_candidate_store()
+        session_root = self._current_session_root_path()
+        if store is None or session_root is None:
+            return "没有可用的录制会话，请先开启录制。"
+        try:
+            candidate = store.get_candidate(candidate_id)
+        except KeyError:
+            return f"找不到候选片段：{candidate_id}"
+        start_wall_ts = float(candidate.get("clip_start_wall_ts", 0.0) or 0.0)
+        end_wall_ts = float(candidate.get("clip_end_wall_ts", 0.0) or 0.0)
+        rows = query_asr_range(
+            session_root,
+            start_wall_ts=start_wall_ts,
+            end_wall_ts=end_wall_ts,
+        )
+        return self._format_asr_reference_rows(
+            session_root,
+            start_wall_ts=start_wall_ts,
+            end_wall_ts=end_wall_ts,
+            rows=rows,
+        )
+
+    def _update_candidate_range(self, candidate_id: str, start_text: str, end_text: str) -> str:
+        store = self._current_candidate_store()
+        if store is None:
+            return "没有可用的录制会话，请先开启录制。"
+        try:
+            current = store.get_candidate(candidate_id)
+        except KeyError:
+            return f"找不到候选片段：{candidate_id}"
+        try:
+            _, start_wall_ts, end_wall_ts = self._parse_session_time_range(
+                start_text,
+                end_text,
+                enforce_clip_duration=True,
+            )
+        except (RuntimeError, ValueError) as exc:
+            return str(exc)
+        next_state = "pending"
+        if str(current.get("state", "") or "").strip().lower() == "rejected":
+            next_state = "rejected"
+        updated = store.update_fields(
+            candidate_id,
+            clip_start_wall_ts=round(start_wall_ts, 3),
+            clip_end_wall_ts=round(end_wall_ts, 3),
+            state=next_state,
+            exported_clip_id="",
+            exported_output_path="",
+        )
+        return (
+            f"candidate_id={updated['candidate_id']} "
+            f"state={updated.get('state', 'pending')} "
+            f"time={self._format_candidate_time_range(updated)}"
+        )
+
+    def _update_candidate_state_from_command(
+        self,
+        event: AstrMessageEvent,
+        *,
+        explicit_clip_id: str,
+        new_state: str,
+        example: str,
+    ) -> str:
+        target_id = self._extract_tail_arg(event, explicit_clip_id, min_parts=5)
+        if not target_id:
+            return f"缺少 clip_id。例如：{example}"
+        store = self._current_candidate_store()
+        if store is None:
+            return "没有可用的录制会话，请先开启录制。"
+        try:
+            updated = store.update_state(target_id, new_state)
+        except KeyError:
+            return f"找不到候选片段：{target_id}"
+        return (
+            f"candidate_id={updated['candidate_id']} "
+            f"state={updated['state']} "
+            f"time={self._format_candidate_time_range(updated)} "
+            f"topic={updated.get('topic', '-')}"
+        )
+
+    async def _export_manual_clip_by_range(
+        self,
+        *,
+        start_text: str,
+        end_text: str,
+        source: str,
+        label: str = "",
+    ) -> str:
+        cfg = self._load_config()
+        try:
+            session_root, start_wall_ts, end_wall_ts = self._parse_session_time_range(
+                start_text,
+                end_text,
+                enforce_clip_duration=True,
+            )
+        except (RuntimeError, ValueError) as exc:
+            return str(exc)
+        try:
+            exporter = ClipExporterRuntime(
+                session_root=session_root,
+                ffmpeg_path=cfg.ffmpeg_path,
+                output_container="mp4",
+            )
+            clip = await exporter.export_clip(
+                clip_range=ClipRange(
+                    start_wall_ts=start_wall_ts,
+                    end_wall_ts=end_wall_ts,
+                ),
+                source=source,
+                build_srt=False,
+                label=label,
+            )
+        except Exception as exc:
+            return self._format_clip_export_error(exc)
+        return (
+            f"clip_id={clip['clip_id']}\n"
+            f"range={start_text}-{end_text}\n"
+            f"output={clip['output_path']}\n"
+            f"duration_seconds={clip['duration_seconds']:.1f}"
+        )
+
+    async def _export_candidate_clip(self, candidate_id: str) -> str:
+        target_id = str(candidate_id or "").strip()
+        store = self._current_candidate_store()
+        if store is None:
+            return "没有可用的录制会话，请先开启录制。"
+        try:
+            candidate = store.get_candidate(target_id)
+        except KeyError:
+            return f"找不到候选片段：{target_id}"
+        cfg = self._load_config()
+        try:
+            existing_clip_id = str(candidate.get("exported_clip_id", "") or "").strip()
+            existing_output_path = str(candidate.get("exported_output_path", "") or "").strip()
+            if existing_clip_id and existing_output_path and Path(existing_output_path).expanduser().resolve().exists():
+                return (
+                    f"clip_id={existing_clip_id}\n"
+                    f"time={self._format_candidate_time_range(candidate)}\n"
+                    f"output={existing_output_path}\n"
+                    f"duration_seconds={float(candidate.get('clip_end_wall_ts', 0.0) or 0.0) - float(candidate.get('clip_start_wall_ts', 0.0) or 0.0):.1f}"
+                )
+            exporter = ClipExporterRuntime(
+                session_root=self._last_recording_session_root,
+                ffmpeg_path=cfg.ffmpeg_path,
+                output_container="mp4",
+            )
+            clip = await exporter.export_clip(
+                clip_range=self._candidate_to_clip_range(candidate),
+                source=f"candidate:{target_id}",
+                build_srt=False,
+                label=str(candidate.get("topic", "") or ""),
+                marker_id="",
+                clip_id=existing_clip_id or target_id,
+            )
+            store.update_fields(
+                target_id,
+                state="exported",
+                exported_clip_id=str(clip.get("clip_id", "") or ""),
+                exported_output_path=str(clip.get("output_path", "") or ""),
+            )
+        except Exception as exc:
+            return self._format_clip_export_error(exc, prefix="导出候选片段失败")
+        return (
+            f"clip_id={clip['clip_id']}\n"
+            f"time={self._format_candidate_time_range(candidate)}\n"
+            f"output={clip['output_path']}\n"
+            f"duration_seconds={clip['duration_seconds']:.1f}"
+        )
+
+    def _format_clip_export_error(self, exc: Exception, *, prefix: str = "导出 clip 失败") -> str:
+        message = self._sanitize_error_message(exc)
+        if message == "no recorded segments found in session manifest":
+            cfg = self._load_config()
+            return (
+                f"{prefix}：当前 session 里还没有“已完成并写入 manifest 的录播分段”。\n"
+                "这通常表示：ASR 已经开始写入了，但首个录播分段还没录完，所以暂时还不能切片。\n"
+                f"请至少等待一个录播分段结束后再切；当前分段时长配置为 "
+                f"{cfg.recording_segment_duration_seconds} 秒。"
+            )
+        if message == "clip range is outside recorded segment coverage":
+            return (
+                f"{prefix}：你指定的时间范围超出了当前已录制素材的覆盖范围。\n"
+                "请把开始和结束时间改到已经录到的 segment 范围内再试。"
+            )
+        if message == "clip range crosses an unrecorded gap between segments":
+            return (
+                f"{prefix}：你指定的时间范围跨过了未录到的空档，当前素材无法连续覆盖这段时间。\n"
+                "请缩小范围，或避开中间缺失的那段时间后再试。"
+            )
+        return f"{prefix}：{message}"
+
+    def _candidate_to_clip_range(self, candidate: dict[str, object]):
+        return ClipRange(
+            start_wall_ts=float(candidate.get("clip_start_wall_ts", 0.0) or 0.0),
+            end_wall_ts=float(candidate.get("clip_end_wall_ts", 0.0) or 0.0),
+        )
+
     def _ingest_danmaku(
         self,
         item: DanmakuItem,
@@ -1055,6 +2280,15 @@ class BilibiliLiveWatcherPlugin(Star):
         if include_pending:
             self._buffer.append(item)
         self._context_danmaku_buffer.append(item)
+        if self._timeline_runtime is not None:
+            self._timeline_runtime.append_danmaku(
+                uid=item.uid,
+                nickname=item.nickname,
+                text=item.text,
+                timeline=item.timeline,
+                source=item.source,
+                received_wall_ts=item.ts or time.time(),
+            )
         if prune_now:
             self._prune_old_with_current_window()
         self._debug_log_danmaku(item)
@@ -1087,6 +2321,16 @@ class BilibiliLiveWatcherPlugin(Star):
     def _record_asr_segment(self, seg: ASRSegment):
         self._asr_buffer.append(seg)
         self._context_asr_buffer.append(seg)
+        if self._timeline_runtime is not None:
+            self._timeline_runtime.append_asr(
+                text=seg.text,
+                ts_start=seg.ts_start,
+                ts_end=seg.ts_end,
+                wall_ts_start=seg.wall_ts_start,
+                wall_ts_end=seg.wall_ts_end,
+                conf=seg.conf,
+                source="stream",
+            )
         self._prune_old_with_current_window()
         logger.info(
             "[bili_watcher] ASR segment emitted: text=%r audio=(%.2f-%.2f) wall=(%.2f-%.2f) conf=%.2f",
@@ -1202,6 +2446,10 @@ class BilibiliLiveWatcherPlugin(Star):
                 if not cfg.enabled or self._runtime_room_id != room_id:
                     await asyncio.sleep(DEFAULT_HISTORY_POLL_INTERVAL_SECONDS)
                     continue
+                room_meta = await self._get_room_prompt_meta(room_id=room_id, cookie=cfg.bilibili_cookie)
+                if self._normalize_live_status(room_meta.get("live_status")) != "直播中":
+                    await asyncio.sleep(DEFAULT_HISTORY_POLL_INTERVAL_SECONDS)
+                    continue
                 reason = self._history_poll_reason(cfg)
                 if reason is not None:
                     self._mark_history_poll_attempt()
@@ -1300,9 +2548,9 @@ class BilibiliLiveWatcherPlugin(Star):
             danmaku_items=danmaku_items,
             asr_segments=asr_segments,
             window_seconds=cfg.context_window_seconds,
-            singer_mode_enabled=cfg.singer_mode_enabled,
-            singer_mode_keywords=cfg.singer_mode_keywords,
-            singer_mode_window_seconds=cfg.singer_mode_window_seconds,
+            singer_mode_enabled=False,
+            singer_mode_keywords=[],
+            singer_mode_window_seconds=0,
         )
         fusion.ordered_context = self._build_ordered_context(
             danmaku_items=danmaku_items,
@@ -1317,7 +2565,7 @@ class BilibiliLiveWatcherPlugin(Star):
             fusion=fusion,
             max_reply_chars=cfg.max_reply_chars,
             prompt_template=cfg.generation_prompt_template,
-            singer_mode_instruction=cfg.singer_mode_instruction,
+            singer_mode_instruction="",
         )
         self._debug_log_prompt(prompt)
 
@@ -1532,9 +2780,6 @@ class BilibiliLiveWatcherPlugin(Star):
             normalized = raw_status.strip()
             if normalized in {"直播中", "未开播"}:
                 return normalized
-            lowered = normalized.lower()
-            if lowered in {"1", "live", "on", "streaming"}:
-                return "直播中"
             else:
                 return "未开播"
         if raw_status is None:
@@ -1588,8 +2833,19 @@ class BilibiliLiveWatcherPlugin(Star):
         live_contexts.append(self._build_live_room_state_context(room_state))
         return live_contexts
 
-    async def _get_room_prompt_meta(self, room_id: int, cookie: str) -> dict[str, object]:
-        if self._room_prompt_meta_room_id == room_id and self._room_prompt_meta:
+    async def _get_room_prompt_meta(
+        self,
+        room_id: int,
+        cookie: str,
+        *,
+        force_refresh: bool = False,
+    ) -> dict[str, object]:
+        cache_alive = (
+            self._room_prompt_meta_room_id == room_id
+            and self._room_prompt_meta
+            and (time.time() - self._room_prompt_meta_ts) < DEFAULT_ROOM_META_CACHE_SECONDS
+        )
+        if cache_alive and not force_refresh:
             return dict(self._room_prompt_meta)
         if self._http is None:
             return {}
@@ -1599,8 +2855,9 @@ class BilibiliLiveWatcherPlugin(Star):
             self._room_prompt_meta = {
                 "room_title": meta.room_title,
                 "anchor_name": meta.anchor_name,
-                "live_status": self._normalize_live_status(getattr(meta, "live_status", None)),
+                "live_status": getattr(meta, "live_status", None),
             }
+            self._room_prompt_meta_ts = time.time()
             return dict(self._room_prompt_meta)
         except Exception as e:
             logger.warning(f"[bili_watcher] get room prompt meta failed: {e}")
@@ -2384,6 +3641,35 @@ class BilibiliLiveWatcherPlugin(Star):
                 return "danmu_only"
         return "danmu_only"
 
+    def _normalize_recording_mode(self, raw_mode: object) -> str:
+        aliases = {
+            0: "record_only",
+            1: "record_and_index",
+            2: "record_index_and_ai_clips",
+            "0": "record_only",
+            "1": "record_and_index",
+            "2": "record_index_and_ai_clips",
+            "record_only": "record_only",
+            "record_and_index": "record_and_index",
+            "record_index_and_ai_clips": "record_index_and_ai_clips",
+        }
+        if isinstance(raw_mode, str):
+            return aliases.get(raw_mode.strip().lower(), "record_only")
+        if isinstance(raw_mode, (int, float)):
+            try:
+                return aliases.get(int(raw_mode), "record_only")
+            except Exception:
+                return "record_only"
+        return "record_only"
+
+    def _recording_mode_code(self, recording_mode: str) -> int:
+        mapping = {
+            "record_only": 0,
+            "record_and_index": 1,
+            "record_index_and_ai_clips": 2,
+        }
+        return mapping.get(str(recording_mode or "").strip().lower(), 0)
+
     async def _poll_login_until_complete(self) -> None:
         try:
             while True:
@@ -2747,7 +4033,16 @@ class BilibiliLiveWatcherPlugin(Star):
             default_context_window_seconds,
             1,
         )
-
+        recording_segment_duration_seconds = self._to_int(
+            self._config_get("recording.segment_duration_seconds", 300),
+            300,
+            30,
+        )
+        recording_max_session_hours = self._to_int(
+            self._config_get("recording.max_session_hours", 12),
+            12,
+            1,
+        )
         cookie = str(
             self._config_get("user_auth.bili_cookie", "", legacy_keys=("bili_cookie", "bilibili_cookie")) or ""
         ).strip()
@@ -2915,46 +4210,58 @@ class BilibiliLiveWatcherPlugin(Star):
                 1,
                 -4,
             ),
-            singer_mode_enabled=self._to_bool(
-                self._config_get(
-                    "singer.singer_mode_enabled",
-                    self._config_get("other.singer_mode_enabled", True, legacy_keys=("singer_mode_enabled",)),
-                ),
+            recording_enabled=self._to_bool(self._config_get("global.recording_enabled", False), False),
+            recording_mode=self._normalize_recording_mode(
+                self._config_get("global.recording_mode", 0)
+            ),
+            recording_segment_duration_seconds=recording_segment_duration_seconds,
+            recording_output_container=str(
+                self._config_get("recording.output_container", "mkv") or "mkv"
+            ).strip(),
+            recording_max_session_hours=recording_max_session_hours,
+            storage_runtime_root=str(
+                self._config_get("storage.runtime_root", DEFAULT_RECORDING_RUNTIME_ROOT)
+                or DEFAULT_RECORDING_RUNTIME_ROOT
+            ).strip(),
+            clip_ai_enabled=self._to_bool(self._config_get("clip_ai.enabled", False), False),
+            clip_ai_prompt_template=str(
+                self._config_get("clip_ai.prompt_template", DEFAULT_CLIP_REVIEW_PROMPT_TEMPLATE)
+                or DEFAULT_CLIP_REVIEW_PROMPT_TEMPLATE
+            ).strip(),
+            publish_enabled=self._to_bool(self._config_get("publish.enabled", False), False),
+            publish_default_visibility="self_only",
+            publish_max_retries=self._to_int(self._config_get("publish.max_retries", 3), 3, 0),
+            publish_retry_backoff_seconds=self._to_int(
+                self._config_get("publish.retry_backoff_seconds", 300),
+                300,
+                1,
+            ),
+            publish_default_tid=self._to_int(self._config_get("publish.default_tid", 0), 0, 0),
+            publish_default_tags=self._to_string_list(self._config_get("publish.default_tags", ""), []),
+            publish_use_tid_predict=self._to_bool(self._config_get("publish.use_tid_predict", True), True),
+            publish_use_tag_recommendation=self._to_bool(
+                self._config_get("publish.use_tag_recommendation", True),
                 True,
             ),
-            singer_mode_keywords=self._to_string_list(
+            publish_cover_strategy="midpoint_frame",
+            publish_title_template=str(
+                self._config_get("publish.title_template", "{{room_title}} {{clip_range}} 切片")
+                or "{{room_title}} {{clip_range}} 切片"
+            ).strip(),
+            publish_desc_template=str(
                 self._config_get(
-                    "singer.singer_mode_keywords",
-                    self._config_get(
-                        "other.singer_mode_keywords",
-                        list(DEFAULT_SINGER_KEYWORDS),
-                        legacy_keys=("singer_mode_keywords",),
-                    ),
-                ),
-                list(DEFAULT_SINGER_KEYWORDS),
-            ),
-            singer_mode_window_seconds=self._to_int(
-                self._config_get(
-                    "singer.singer_mode_window_seconds",
-                    self._config_get(
-                        "other.singer_mode_window_seconds",
-                        20,
-                        legacy_keys=("singer_mode_window_seconds",),
-                    ),
-                ),
-                20,
-                0,
-            ),
-            singer_mode_instruction=str(
-                self._config_get(
-                    "singer.singer_mode_instruction",
-                    self._config_get(
-                        "other.singer_mode_instruction",
-                        DEFAULT_SINGER_MODE_INSTRUCTION,
-                        legacy_keys=("singer_mode_instruction",),
-                    ),
+                    "publish.desc_template",
+                    "主播：{{anchor_name}}\n"
+                    "直播间：https://live.bilibili.com/{{real_room_id}}\n"
+                    "日期：{{clip_date}}\n\n"
+                    "{{auto_desc}}",
                 )
-                or ""
+                or (
+                    "主播：{{anchor_name}}\n"
+                    "直播间：https://live.bilibili.com/{{real_room_id}}\n"
+                    "日期：{{clip_date}}\n\n"
+                    "{{auto_desc}}"
+                )
             ).strip(),
         )
 

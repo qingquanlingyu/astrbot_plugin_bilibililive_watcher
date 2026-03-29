@@ -51,10 +51,30 @@ class WatchConfig:
     asr_sense_voice_use_itn: bool
     asr_runtime_probe_required: bool
     asr_threads: int
-    singer_mode_enabled: bool
-    singer_mode_keywords: list[str]
-    singer_mode_window_seconds: int
-    singer_mode_instruction: str
+    recording_enabled: bool = False
+    recording_mode: str = "record_only"
+    recording_segment_duration_seconds: int = 300
+    recording_output_container: str = "mkv"
+    recording_max_session_hours: int = 12
+    storage_runtime_root: str = "/mnt/ssd/bilibili"
+    clip_ai_enabled: bool = False
+    clip_ai_prompt_template: str = ""
+    publish_enabled: bool = False
+    publish_default_visibility: str = "self_only"
+    publish_max_retries: int = 3
+    publish_retry_backoff_seconds: int = 300
+    publish_default_tid: int = 0
+    publish_default_tags: list[str] = field(default_factory=list)
+    publish_use_tid_predict: bool = True
+    publish_use_tag_recommendation: bool = True
+    publish_cover_strategy: str = "midpoint_frame"
+    publish_title_template: str = "{{room_title}} {{clip_range}} 切片"
+    publish_desc_template: str = (
+        "主播：{{anchor_name}}\n"
+        "直播间：https://live.bilibili.com/{{real_room_id}}\n"
+        "日期：{{clip_date}}\n\n"
+        "{{auto_desc}}"
+    )
 
 
 @dataclass(slots=True)
