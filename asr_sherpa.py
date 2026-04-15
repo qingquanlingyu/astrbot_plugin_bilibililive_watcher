@@ -4,6 +4,7 @@ import array
 import importlib
 import math
 import re
+import shutil
 import subprocess
 import time
 from dataclasses import dataclass
@@ -108,7 +109,7 @@ class SherpaRuntimeAdapter:
         if spec.provider == "rknn" and not self._wheel_support_checker(sherpa_onnx):
             return SherpaRuntimeProbeResult(
                 enabled=False,
-                reason="current sherpa_onnx wheel has no RKNN support (ldd missing librknnrt.so)",
+                reason="current sherpa_onnx wheel has no RKNN support (no librknnrt.so linkage detected)",
                 provider=spec.provider,
                 model_format=spec.model_format,
                 threads=threads,
@@ -583,18 +584,38 @@ def sherpa_wheel_has_rknn_support(sherpa_onnx_module) -> bool:
     if not matches:
         return False
     so_path = matches[0]
+
+    def _probe_with_command(command: list[str]) -> bool | None:
+        tool = shutil.which(command[0])
+        if not tool:
+            return None
+        try:
+            proc = subprocess.run(
+                [tool, *command[1:]],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=10,
+            )
+        except Exception:
+            return None
+        output = proc.stdout + "\n" + proc.stderr
+        if "librknnrt.so" in output:
+            return True
+        return None if proc.returncode != 0 else False
+
+    ldd_result = _probe_with_command(["ldd", str(so_path)])
+    if ldd_result is not None:
+        return ldd_result
+
+    readelf_result = _probe_with_command(["readelf", "-d", str(so_path)])
+    if readelf_result is not None:
+        return readelf_result
+
     try:
-        proc = subprocess.run(
-            ["ldd", str(so_path)],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=10,
-        )
+        return b"librknnrt.so" in so_path.read_bytes()
     except Exception:
         return False
-    output = proc.stdout + "\n" + proc.stderr
-    return "librknnrt.so" in output
 
 
 def _resolve_onnx_component(model_dir: Path, stem: str) -> Path | None:

@@ -7,13 +7,28 @@
 
 默认升级行为保持不变：`sync_to_bilibili_live=false` 时，仍只发送到 AstrBot。
 
-另外，插件现在提供两个面向 LLM 的工具：
+另外，插件现在提供八个面向 LLM 的工具：
 
 - `bili_live_context_window`
   - 供模型在“用户询问当前直播内容”时读取近期弹幕和主播语音上下文。
 - `bili_live_send_danmaku`
   - 供模型在“用户明确要求代发直播弹幕”时直接向当前监听直播间发送 1 条弹幕。
   - 该工具不依赖 `sync_to_bilibili_live` 开关；它是显式代发工具，不是自动同步开关。
+- `bili_clip_review_candidates`
+  - 供模型查看本场直播当前录制 session 的 AI 候选片段列表。
+  - 支持按需触发一次刷新扫描，再返回最新候选。
+- `bili_asr_range_reference`
+  - 供模型按 `HH:MM:SS` 时间范围读取本场直播该时间段内的 ASR 结果。
+- `bili_asr_keyword_search`
+  - 供模型按关键词检索本场直播 ASR 结果。
+  - 支持用 `|` 表示多个关键词的 OR 查询，返回命中片段的时间段和文本。
+- `bili_recent_exported_clips`
+  - 供模型在“用户要求上传/投稿视频”时查看最近已导出的 clip，并选择 `clip_id`。
+- `bili_publish_clip`
+  - 供模型在“用户明确要求上传/投稿/发布视频”时直接创建投稿草稿，并可立即入队上传。
+  - 模型可以自行生成标题、简介、标签和分区；未提供 `clip_id` 时会优先选最近导出的 clip。
+- `bili_publish_job_status`
+  - 供模型查询投稿作业状态、失败原因，以及最终 `aid` / `bvid`。
 
 ## 当前能力
 
@@ -85,6 +100,9 @@ https://github.com/k2-fsa/sherpa-onnx/releases/tag/asr-models
 - `/biliwatch context-window <seconds>`
   设置上下文保留窗口。
   值越大，模型能参考的近期弹幕和 ASR 越多，但也更容易混入旧话题。
+- `/biliwatch max-reply-chars <count>`
+  设置模型生成弹幕的最大字符数。
+  当前命令要求输入 `10` 或更大的整数。
 - `/biliwatch danmaku-threshold <count>`
   设置触发生成前至少需要积累多少条弹幕。
   设为 `0` 表示不要求弹幕条数门槛。
@@ -145,7 +163,8 @@ https://github.com/k2-fsa/sherpa-onnx/releases/tag/asr-models
 5. 如果需要查看回放上下文，用 `/biliwatch asr range 00:10:00 00:12:30`
 6. 如果模型已经产出候选，用 `clip review list -> clip review asr -> clip review set-range -> clip review approve / reject`
 7. 如果想把确认后的 clip 投稿，先开启 `publish.enabled`，再执行 `publish submit -> publish status / update-* -> publish approve`
-8. 如果想把内容真正发回 B 站直播间，再执行 `/biliwatch login` 和 `/biliwatch sync-live on`
+8. 如果希望让 LLM 自主上传，可直接在对话里明确授权它“上传/投稿这个 clip”，模型会调用 `bili_recent_exported_clips -> bili_publish_clip -> bili_publish_job_status`
+9. 如果想把内容真正发回 B 站直播间，再执行 `/biliwatch login` 和 `/biliwatch sync-live on`
 
 ## 安装与前置
 

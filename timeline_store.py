@@ -58,6 +58,40 @@ def query_asr_range(
     return sorted(rows, key=lambda item: float(item.get("wall_ts_start", 0.0) or 0.0))
 
 
+def search_asr_keywords(
+    session_root: str | Path,
+    *,
+    keywords: list[str],
+) -> list[dict]:
+    normalized: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for item in list(keywords or []):
+        keyword = str(item or "").strip()
+        if not keyword:
+            continue
+        folded = keyword.casefold()
+        if folded in seen:
+            continue
+        seen.add(folded)
+        normalized.append((keyword, folded))
+    if not normalized:
+        return []
+
+    rows: list[dict] = []
+    for item in load_timeline_asr(session_root):
+        text = str(item.get("text", "") or "").strip()
+        if not text:
+            continue
+        text_folded = text.casefold()
+        matched_keywords = [keyword for keyword, folded in normalized if folded in text_folded]
+        if not matched_keywords:
+            continue
+        enriched = dict(item)
+        enriched["matched_keywords"] = matched_keywords
+        rows.append(enriched)
+    return sorted(rows, key=lambda item: float(item.get("wall_ts_start", 0.0) or 0.0))
+
+
 class TimelineIndexerRuntime:
     def __init__(self, *, session_root: str | Path, session_id: str):
         self.session_root = Path(session_root).expanduser().resolve()

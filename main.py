@@ -32,7 +32,7 @@ if __package__:
     from .bili_ws import DanmakuRealtimeClient
     from .clip_ai import ClipPlannerRuntime
     from .clip_time import format_hhmmss, get_session_started_at, resolve_range_to_wall_ts, wall_ts_to_hhmmss
-    from .clip_exporter import ClipExporterRuntime, ClipRange, find_clip_by_id
+    from .clip_exporter import ClipExporterRuntime, ClipRange, find_clip_by_id, list_recent_clips
     from .clip_review import ClipCandidateStore
     from .fusion import FusionEngine
     from .models import ASRSegment, ChannelSendState, DanmakuItem, LoginRuntimeState, WatchConfig
@@ -45,7 +45,7 @@ if __package__:
     )
     from .recording_manifest import SessionLayout, load_session_index, update_session_index
     from .recording_runtime import LiveRecorderRuntime
-    from .timeline_store import TimelineIndexerRuntime, query_asr_range
+    from .timeline_store import TimelineIndexerRuntime, query_asr_range, search_asr_keywords
 else:  # pragma: no cover
     from asr_sherpa import SherpaASRWorker, build_asr_worker_or_none
     from audio_pipe import AudioCaptureWorker, AudioRequestOptions
@@ -59,7 +59,7 @@ else:  # pragma: no cover
     from bili_ws import DanmakuRealtimeClient
     from clip_ai import ClipPlannerRuntime
     from clip_time import format_hhmmss, get_session_started_at, resolve_range_to_wall_ts, wall_ts_to_hhmmss
-    from clip_exporter import ClipExporterRuntime, ClipRange, find_clip_by_id
+    from clip_exporter import ClipExporterRuntime, ClipRange, find_clip_by_id, list_recent_clips
     from clip_review import ClipCandidateStore
     from fusion import FusionEngine
     from models import ASRSegment, ChannelSendState, DanmakuItem, LoginRuntimeState, WatchConfig
@@ -72,7 +72,7 @@ else:  # pragma: no cover
     )
     from recording_manifest import SessionLayout, load_session_index, update_session_index
     from recording_runtime import LiveRecorderRuntime
-    from timeline_store import TimelineIndexerRuntime, query_asr_range
+    from timeline_store import TimelineIndexerRuntime, query_asr_range, search_asr_keywords
 
 DEFAULT_ASR_MODEL_DIR = (
     "./models/sherpa/rknn/"
@@ -186,6 +186,8 @@ class BilibiliLiveWatcherPlugin(Star):
         self._account_status_cache: BiliLoginAccount | None = None
         self._account_status_cache_ts = 0.0
         self._publish_runtime: PublishRuntime | None = None
+        if self._migrate_config_schema_paths_if_needed():
+            self._save_config_if_possible()
 
     async def initialize(self):
         if self._task and not self._task.done():
@@ -242,6 +244,7 @@ class BilibiliLiveWatcherPlugin(Star):
             "/biliwatch sync-live [on|off] - 开启或关闭同步发送到 B 站直播弹幕",
             "/biliwatch reply-interval <seconds> - 设置主循环检查间隔",
             "/biliwatch context-window <seconds> - 设置保留给融合和 prompt 的上下文窗口",
+            "/biliwatch max-reply-chars <count> - 设置模型生成弹幕的最大字符数",
             "/biliwatch danmaku-threshold <count> - 设置触发前至少需要多少条弹幕",
             "/biliwatch asr-threshold <count> - 设置触发前至少需要多少条 ASR 语句",
             "/biliwatch asr range <HH:MM:SS> <HH:MM:SS> - 查看时间范围内的 ASR 参考文本",
@@ -323,6 +326,7 @@ class BilibiliLiveWatcherPlugin(Star):
                     f"bili_live_send: {self._format_channel_send_state(self._bili_live_send_state)}",
                     f"reply_interval_seconds: {cfg.reply_interval_seconds}",
                     f"context_window_seconds: {cfg.context_window_seconds}",
+                    f"max_reply_chars: {cfg.max_reply_chars}",
                     f"danmaku_trigger_threshold: {cfg.danmaku_trigger_threshold}",
                     f"asr_trigger_threshold: {cfg.asr_trigger_threshold}",
                     f"pending_danmaku_buffer_size: {len(self._buffer)}",
@@ -419,7 +423,12 @@ class BilibiliLiveWatcherPlugin(Star):
                 raw = parts[-1].strip().lower()
 
         current = self._to_bool(
-            self._config_get("global.auto_reply_enabled", False, legacy_keys=("auto_reply_enabled",)),
+            self._config_get_with_fallback_paths(
+                "danmu_loop.auto_reply_enabled",
+                False,
+                fallback_paths=("global.auto_reply_enabled",),
+                legacy_keys=("auto_reply_enabled",),
+            ),
             False,
         )
         if raw in ("on", "enable", "enabled", "true", "1", "开", "开启"):
@@ -429,7 +438,8 @@ class BilibiliLiveWatcherPlugin(Star):
         else:
             new_value = not current
 
-        self._set_config_value("global.auto_reply_enabled", new_value)
+        self._set_config_value("danmu_loop.auto_reply_enabled", new_value)
+        self._config_delete_path("global.auto_reply_enabled")
         if not new_value:
             self._buffer.clear()
             self._asr_buffer.clear()
@@ -469,10 +479,11 @@ class BilibiliLiveWatcherPlugin(Star):
         result = self._set_integer_config_from_command(
             event,
             explicit_value=value,
-            config_key="main_loop.reply_interval_seconds",
+            config_key="danmu_loop.reply_interval_seconds",
             label="reply_interval_seconds",
             min_value=1,
             example="/biliwatch reply-interval 15",
+            obsolete_paths=("main_loop.reply_interval_seconds",),
         )
         yield event.plain_result(result)
 
@@ -481,10 +492,23 @@ class BilibiliLiveWatcherPlugin(Star):
         result = self._set_integer_config_from_command(
             event,
             explicit_value=value,
-            config_key="main_loop.context_window_seconds",
+            config_key="global.context_window_seconds",
             label="context_window_seconds",
             min_value=1,
             example="/biliwatch context-window 45",
+            obsolete_paths=("main_loop.context_window_seconds",),
+        )
+        yield event.plain_result(result)
+
+    @filter.command("biliwatch max-reply-chars")
+    async def biliwatch_set_max_reply_chars(self, event: AstrMessageEvent, value: str = ""):
+        result = self._set_integer_config_from_command(
+            event,
+            explicit_value=value,
+            config_key="generation.max_reply_chars",
+            label="max_reply_chars",
+            min_value=10,
+            example="/biliwatch max-reply-chars 30",
         )
         yield event.plain_result(result)
 
@@ -493,10 +517,11 @@ class BilibiliLiveWatcherPlugin(Star):
         result = self._set_integer_config_from_command(
             event,
             explicit_value=value,
-            config_key="main_loop.danmaku_trigger_threshold",
+            config_key="danmu_loop.danmaku_trigger_threshold",
             label="danmaku_trigger_threshold",
             min_value=0,
             example="/biliwatch danmaku-threshold 10",
+            obsolete_paths=("main_loop.danmaku_trigger_threshold",),
         )
         yield event.plain_result(result)
 
@@ -505,10 +530,11 @@ class BilibiliLiveWatcherPlugin(Star):
         result = self._set_integer_config_from_command(
             event,
             explicit_value=value,
-            config_key="main_loop.asr_trigger_threshold",
+            config_key="danmu_loop.asr_trigger_threshold",
             label="asr_trigger_threshold",
             min_value=0,
             example="/biliwatch asr-threshold 2",
+            obsolete_paths=("main_loop.asr_trigger_threshold",),
         )
         yield event.plain_result(result)
 
@@ -1176,6 +1202,417 @@ class BilibiliLiveWatcherPlugin(Star):
             auto_sync_enabled=cfg.sync_to_bilibili_live,
         )
 
+    @filter.llm_tool(name="bili_recent_exported_clips")
+    async def bili_recent_exported_clips(self, event: AstrMessageEvent, limit: int = 5):
+        """
+        获取最近已导出的直播 clip 列表，供视频投稿前选择 clip_id。
+        当用户要求你上传/投稿视频、列出可投稿片段，或要求直接上传“最近一个 clip”时调用。
+        通常先调用它，再调用 bili_publish_clip。
+        Args:
+            limit(int): 返回最近几条 clip，建议 1-10。
+        """
+        del event
+        cfg = self._load_config()
+        resolved_limit = max(1, min(self._to_int(limit, 5, 1), 10))
+        clips = list_recent_clips(cfg.storage_runtime_root, limit=resolved_limit)
+        return self._dump_recent_clips_tool_result(
+            available=bool(clips),
+            reason="ok" if clips else "no_exported_clips",
+            clips=clips,
+        )
+
+    @filter.llm_tool(name="bili_clip_review_candidates")
+    async def bili_clip_review_candidates(
+        self,
+        event: AstrMessageEvent,
+        limit: int = 10,
+        refresh: bool = False,
+    ):
+        """
+        获取当前直播录制 session 的 AI 候选片段列表。
+        当用户要求你查看“这场直播有哪些候选切片/高能片段”、挑选候选片段，或准备继续做 clip 审核时调用。
+        默认只读取当前候选列表；如果你需要尽量刷新到最新结果，可将 refresh 设为 true。
+        Args:
+            limit(int): 返回候选条数，建议 1-20。
+            refresh(bool): 是否先主动触发一次候选扫描再返回结果。
+        """
+        del event
+        cfg = self._load_config()
+        resolved_limit = max(1, min(self._to_int(limit, 10, 1), 20))
+        refreshed = False
+        if refresh:
+            rows = await self._scan_ai_candidates(cfg, force=True)
+            refreshed = True
+        else:
+            store = self._current_candidate_store()
+            rows = store.list_candidates() if store is not None else []
+        session_root = self._current_session_root_path()
+        if session_root is None:
+            return self._dump_clip_review_candidates_tool_result(
+                available=False,
+                reason="no_recording_session",
+                candidates=[],
+                limit=resolved_limit,
+                total=0,
+                refreshed=refreshed,
+                session_root="",
+            )
+        return self._dump_clip_review_candidates_tool_result(
+            available=bool(rows),
+            reason="ok" if rows else "no_candidates",
+            candidates=rows[:resolved_limit],
+            limit=resolved_limit,
+            total=len(rows),
+            refreshed=refreshed,
+            session_root=str(session_root),
+        )
+
+    @filter.llm_tool(name="bili_asr_range_reference")
+    async def bili_asr_range_reference(
+        self,
+        event: AstrMessageEvent,
+        start_time: str = "",
+        end_time: str = "",
+        limit: int = 80,
+    ):
+        """
+        获取当前直播录制 session 中指定时间范围的 ASR 文本。
+        当用户已经给出了大致时间段，或你需要核对某段直播里主播具体说了什么时调用。
+        Args:
+            start_time(string): 开始时间，格式 HH:MM:SS。
+            end_time(string): 结束时间，格式 HH:MM:SS。
+            limit(int): 最多返回多少条 ASR 片段，建议 1-120。
+        """
+        del event
+        resolved_limit = max(1, min(self._to_int(limit, 80, 1), 120))
+        start_text = str(start_time or "").strip()
+        end_text = str(end_time or "").strip()
+        if not start_text or not end_text:
+            return self._dump_asr_lookup_tool_result(
+                available=False,
+                reason="missing_time_range",
+                rows=[],
+                total=0,
+                session_root="",
+                start_time=start_text,
+                end_time=end_text,
+                keywords=[],
+                keyword_query="",
+                limit=resolved_limit,
+            )
+        try:
+            session_root, start_wall_ts, end_wall_ts = self._parse_session_time_range(
+                start_text,
+                end_text,
+                enforce_clip_duration=False,
+            )
+        except RuntimeError as exc:
+            return self._dump_asr_lookup_tool_result(
+                available=False,
+                reason="no_recording_session",
+                rows=[],
+                total=0,
+                session_root="",
+                start_time=start_text,
+                end_time=end_text,
+                keywords=[],
+                keyword_query="",
+                limit=resolved_limit,
+                error=str(exc),
+            )
+        except ValueError as exc:
+            return self._dump_asr_lookup_tool_result(
+                available=False,
+                reason="invalid_time_range",
+                rows=[],
+                total=0,
+                session_root=str(self._current_session_root_path() or ""),
+                start_time=start_text,
+                end_time=end_text,
+                keywords=[],
+                keyword_query="",
+                limit=resolved_limit,
+                error=str(exc),
+            )
+
+        rows = query_asr_range(
+            session_root,
+            start_wall_ts=start_wall_ts,
+            end_wall_ts=end_wall_ts,
+        )
+        return self._dump_asr_lookup_tool_result(
+            available=bool(rows),
+            reason="ok" if rows else "no_asr_in_range",
+            rows=rows[:resolved_limit],
+            total=len(rows),
+            session_root=str(session_root),
+            start_time=start_text,
+            end_time=end_text,
+            keywords=[],
+            keyword_query="",
+            limit=resolved_limit,
+        )
+
+    @filter.llm_tool(name="bili_asr_keyword_search")
+    async def bili_asr_keyword_search(
+        self,
+        event: AstrMessageEvent,
+        keywords: str = "",
+        limit: int = 50,
+    ):
+        """
+        在当前直播录制 session 的全部 ASR 中按关键词检索片段。
+        当用户想找“主播什么时候提到某个词/话题”，或你需要先定位相关时间段再继续分析时调用。
+        关键词支持使用竖线 `|` 表示多个关键词的 OR 查询。
+        Args:
+            keywords(string): 关键词查询，例如 `抽奖|福袋|上链接`。
+            limit(int): 最多返回多少条命中片段，建议 1-120。
+        """
+        del event
+        resolved_limit = max(1, min(self._to_int(limit, 50, 1), 120))
+        keyword_query = str(keywords or "").strip()
+        parsed_keywords = self._parse_asr_keyword_query(keyword_query)
+        session_root = self._current_session_root_path()
+        if session_root is None:
+            return self._dump_asr_lookup_tool_result(
+                available=False,
+                reason="no_recording_session",
+                rows=[],
+                total=0,
+                session_root="",
+                start_time="",
+                end_time="",
+                keywords=parsed_keywords,
+                keyword_query=keyword_query,
+                limit=resolved_limit,
+            )
+        if not parsed_keywords:
+            return self._dump_asr_lookup_tool_result(
+                available=False,
+                reason="missing_keywords",
+                rows=[],
+                total=0,
+                session_root=str(session_root),
+                start_time="",
+                end_time="",
+                keywords=[],
+                keyword_query=keyword_query,
+                limit=resolved_limit,
+            )
+        rows = search_asr_keywords(session_root, keywords=parsed_keywords)
+        return self._dump_asr_lookup_tool_result(
+            available=bool(rows),
+            reason="ok" if rows else "no_keyword_matches",
+            rows=rows[:resolved_limit],
+            total=len(rows),
+            session_root=str(session_root),
+            start_time="",
+            end_time="",
+            keywords=parsed_keywords,
+            keyword_query=keyword_query,
+            limit=resolved_limit,
+        )
+
+    @filter.llm_tool(name="bili_publish_clip")
+    async def bili_publish_clip(
+        self,
+        event: AstrMessageEvent,
+        clip_id: str = "",
+        title: str = "",
+        desc: str = "",
+        tags: str = "",
+        tid: int = 0,
+        upload_now: bool = True,
+        wait_seconds: int = 0,
+    ):
+        """
+        为已导出的直播 clip 创建投稿草稿，并可立即入队上传。
+        仅当用户明确要求你上传/投稿/发布视频，或明确授权你代为发布视频时调用。
+        你可以自行生成标题、简介、标签和分区 tid；若用户未指定 clip_id，可先调用 bili_recent_exported_clips，
+        或在未提供 clip_id 时默认选择最近导出的 clip。
+        如果用户只是想先准备草稿而不是立刻上传，请把 upload_now 设为 false。
+        Args:
+            clip_id(string): 要投稿的 clip_id；留空时自动选择最近导出的 clip。
+            title(string): 视频标题，最多 80 字符。
+            desc(string): 视频简介。
+            tags(string): 标签，使用英文逗号分隔。
+            tid(int): B 站分区 tid；传 0 表示使用默认值。
+            upload_now(bool): 是否创建草稿后立刻入队上传。
+            wait_seconds(int): 上传后额外等待多少秒再返回最新状态，建议 0-15。
+        """
+        del event
+        cfg = self._load_config()
+        if not cfg.publish_enabled:
+            return self._dump_publish_tool_result(
+                accepted=False,
+                reason="publish_disabled",
+                requested_clip_id=clip_id,
+                resolved_clip=None,
+                job=None,
+                upload_now=upload_now,
+                used_latest_clip=False,
+                draft_created=False,
+                approved=False,
+            )
+        if self._publish_runtime is None:
+            return self._dump_publish_tool_result(
+                accepted=False,
+                reason="publish_runtime_unavailable",
+                requested_clip_id=clip_id,
+                resolved_clip=None,
+                job=None,
+                upload_now=upload_now,
+                used_latest_clip=False,
+                draft_created=False,
+                approved=False,
+            )
+
+        requested_clip_id = str(clip_id or "").strip()
+        used_latest_clip = False
+        target_clip_id = requested_clip_id
+        if not target_clip_id:
+            latest = list_recent_clips(cfg.storage_runtime_root, limit=1)
+            if latest:
+                target_clip_id = str(latest[0].get("clip_id", "") or "").strip()
+                used_latest_clip = bool(target_clip_id)
+        if not target_clip_id:
+            return self._dump_publish_tool_result(
+                accepted=False,
+                reason="no_exported_clips",
+                requested_clip_id=requested_clip_id,
+                resolved_clip=None,
+                job=None,
+                upload_now=upload_now,
+                used_latest_clip=used_latest_clip,
+                draft_created=False,
+                approved=False,
+            )
+
+        clip_row = find_clip_by_id(cfg.storage_runtime_root, target_clip_id)
+        if clip_row is None:
+            return self._dump_publish_tool_result(
+                accepted=False,
+                reason="clip_not_found",
+                requested_clip_id=requested_clip_id,
+                resolved_clip={"clip_id": target_clip_id},
+                job=None,
+                upload_now=upload_now,
+                used_latest_clip=used_latest_clip,
+                draft_created=False,
+                approved=False,
+            )
+
+        explicit_tags = self._to_string_list(tags, []) if str(tags or "").strip() else None
+        explicit_tid = None
+        try:
+            parsed_tid = int(tid or 0)
+            if parsed_tid < 0:
+                raise ValueError
+            if parsed_tid > 0:
+                explicit_tid = parsed_tid
+        except Exception:
+            return self._dump_publish_tool_result(
+                accepted=False,
+                reason="invalid_tid",
+                requested_clip_id=requested_clip_id,
+                resolved_clip=clip_row,
+                job=None,
+                upload_now=upload_now,
+                used_latest_clip=used_latest_clip,
+                draft_created=False,
+                approved=False,
+            )
+
+        draft_created = False
+        approved = False
+        try:
+            draft = build_publish_draft(
+                clip_row=clip_row,
+                title_template=cfg.publish_title_template,
+                desc_template=cfg.publish_desc_template,
+                default_tid=cfg.publish_default_tid,
+                default_tags=cfg.publish_default_tags,
+                visibility=cfg.publish_default_visibility,
+                explicit_title=title,
+                explicit_desc=desc,
+                explicit_tags=explicit_tags,
+                explicit_tid=explicit_tid,
+            )
+            job, duplicate = await self._publish_runtime.submit(
+                draft,
+                max_retries=cfg.publish_max_retries,
+                retry_backoff_seconds=cfg.publish_retry_backoff_seconds,
+                use_tid_predict=cfg.publish_use_tid_predict,
+                use_tag_recommendation=cfg.publish_use_tag_recommendation,
+                cover_strategy=cfg.publish_cover_strategy,
+            )
+            if duplicate is None:
+                draft_created = True
+            elif job.state == "draft":
+                job = await self._publish_runtime.update_draft(
+                    job.job_id,
+                    title=draft.title,
+                    desc=draft.desc,
+                    tags=draft.tags,
+                    tid=draft.tid,
+                )
+            if upload_now and job.state == "draft":
+                job = await self._publish_runtime.approve(job.job_id)
+                approved = True
+            wait_timeout = max(0, min(self._to_int(wait_seconds, 0, 0), 15))
+            if upload_now and wait_timeout > 0:
+                waited_job = await self._wait_for_publish_job(job.job_id, timeout_seconds=wait_timeout)
+                if waited_job is not None:
+                    job = waited_job
+        except Exception as exc:
+            return self._dump_publish_tool_result(
+                accepted=False,
+                reason=self._sanitize_error_message(exc),
+                requested_clip_id=requested_clip_id,
+                resolved_clip=clip_row,
+                job=None,
+                upload_now=upload_now,
+                used_latest_clip=used_latest_clip,
+                draft_created=draft_created,
+                approved=approved,
+            )
+
+        return self._dump_publish_tool_result(
+            accepted=True,
+            reason="ok",
+            requested_clip_id=requested_clip_id,
+            resolved_clip=clip_row,
+            job=job,
+            upload_now=upload_now,
+            used_latest_clip=used_latest_clip,
+            draft_created=draft_created,
+            approved=approved,
+        )
+
+    @filter.llm_tool(name="bili_publish_job_status")
+    async def bili_publish_job_status(self, event: AstrMessageEvent, job_id: str = "", wait_seconds: int = 0):
+        """
+        查询视频投稿作业状态。
+        当你已经调用过 bili_publish_clip，想确认是否投稿成功、是否拿到 bvid，或要查看失败原因时调用。
+        Args:
+            job_id(string): 投稿作业 job_id。
+            wait_seconds(int): 额外等待多少秒以便观察状态变化，建议 0-15。
+        """
+        del event
+        if self._publish_runtime is None:
+            return self._dump_publish_job_status_tool_result(found=False, reason="publish_runtime_unavailable", job=None)
+        target_id = str(job_id or "").strip()
+        if not target_id:
+            return self._dump_publish_job_status_tool_result(found=False, reason="missing_job_id", job=None)
+        wait_timeout = max(0, min(self._to_int(wait_seconds, 0, 0), 15))
+        if wait_timeout > 0:
+            job = await self._wait_for_publish_job(target_id, timeout_seconds=wait_timeout)
+        else:
+            job = self._publish_runtime.get_job(target_id)
+        if job is None:
+            return self._dump_publish_job_status_tool_result(found=False, reason="job_not_found", job=None)
+        return self._dump_publish_job_status_tool_result(found=True, reason="ok", job=job)
+
     @filter.on_llm_request()
     async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
         cfg = self._load_config()
@@ -1188,6 +1625,12 @@ class BilibiliLiveWatcherPlugin(Star):
         room_meta = await self._get_room_prompt_meta(room_id=room_id, cookie=cfg.bilibili_cookie)
         room_state = self._build_live_room_state_payload(cfg=cfg, room_id=room_id, room_meta=room_meta)
         payloads = [self._build_live_room_state_payload_text(room_state)]
+        review_tool_guidance = self._build_review_tool_guidance_text(cfg)
+        if review_tool_guidance:
+            payloads.append(review_tool_guidance)
+        publish_tool_guidance = self._build_publish_tool_guidance_text(cfg)
+        if publish_tool_guidance:
+            payloads.append(publish_tool_guidance)
 
         parts = self._ensure_extra_user_parts(req)
         if parts is None:
@@ -1865,6 +2308,21 @@ class BilibiliLiveWatcherPlugin(Star):
             resolved.append(explicit or (tail[index].strip() if len(tail) == count else ""))
         return tuple(resolved)
 
+    @staticmethod
+    def _parse_asr_keyword_query(keyword_query: str) -> list[str]:
+        keywords: list[str] = []
+        seen: set[str] = set()
+        for raw_part in str(keyword_query or "").split("|"):
+            keyword = str(raw_part or "").strip()
+            if not keyword:
+                continue
+            folded = keyword.casefold()
+            if folded in seen:
+                continue
+            seen.add(folded)
+            keywords.append(keyword)
+        return keywords
+
     def _parse_publish_submit_command(
         self,
         event: AstrMessageEvent,
@@ -1983,6 +2441,235 @@ class BilibiliLiveWatcherPlugin(Star):
             f"updated_at={self._format_timestamp(job.updated_at)}",
         ]
         return "\n".join(lines)
+
+    def _serialize_publish_job(self, job: PublishJob | None) -> dict[str, object] | None:
+        if job is None:
+            return None
+        return {
+            "job_id": job.job_id,
+            "state": job.state,
+            "clip_id": job.clip_id,
+            "session_id": job.session_id,
+            "title": job.title,
+            "desc": job.desc,
+            "tid": job.tid,
+            "tags": list(job.tags or []),
+            "visibility": job.visibility,
+            "retry_count": job.retry_count,
+            "max_retries": job.max_retries,
+            "last_error": job.last_error,
+            "aid": job.aid,
+            "bvid": job.bvid,
+            "archive_url": job.archive_url,
+            "created_at": job.created_at,
+            "updated_at": job.updated_at,
+            "created_at_text": self._format_timestamp(job.created_at),
+            "updated_at_text": self._format_timestamp(job.updated_at),
+        }
+
+    def _serialize_clip_row(self, clip_row: dict[str, object] | None) -> dict[str, object] | None:
+        if not clip_row:
+            return None
+        row = dict(clip_row)
+        return {
+            "clip_id": str(row.get("clip_id", "") or "").strip(),
+            "session_id": str(row.get("session_id", "") or "").strip(),
+            "session_root": str(row.get("session_root", "") or "").strip(),
+            "output_path": str(row.get("output_path", "") or "").strip(),
+            "duration_seconds": float(row.get("duration_seconds", 0.0) or 0.0),
+            "anchor_name": str(row.get("anchor_name", "") or "").strip(),
+            "room_title": str(row.get("room_title", "") or "").strip(),
+            "clip_date": str(row.get("clip_date", "") or "").strip(),
+            "source": str(row.get("source", "") or "").strip(),
+            "label": str(row.get("label", "") or "").strip(),
+            "created_at": float(row.get("created_at", 0.0) or 0.0),
+            "created_at_text": self._format_timestamp(float(row.get("created_at", 0.0) or 0.0)),
+        }
+
+    def _serialize_candidate_row(self, candidate_row: dict[str, object] | None) -> dict[str, object] | None:
+        if not candidate_row:
+            return None
+        row = dict(candidate_row)
+        return {
+            "candidate_id": str(row.get("candidate_id", "") or "").strip(),
+            "candidate_type": str(row.get("candidate_type", "") or "").strip(),
+            "state": str(row.get("state", "pending") or "pending").strip(),
+            "score": float(row.get("score", 0.0) or 0.0),
+            "topic": str(row.get("topic", "") or "").strip(),
+            "summary": str(row.get("summary", "") or "").strip(),
+            "clip_start_wall_ts": float(row.get("clip_start_wall_ts", 0.0) or 0.0),
+            "clip_end_wall_ts": float(row.get("clip_end_wall_ts", 0.0) or 0.0),
+            "clip_range_text": self._format_candidate_time_range(row),
+            "exported_clip_id": str(row.get("exported_clip_id", "") or "").strip(),
+            "exported_output_path": str(row.get("exported_output_path", "") or "").strip(),
+            "created_at": float(row.get("created_at", 0.0) or 0.0),
+            "updated_at": float(row.get("updated_at", 0.0) or 0.0),
+            "created_at_text": self._format_timestamp(float(row.get("created_at", 0.0) or 0.0)),
+            "updated_at_text": self._format_timestamp(float(row.get("updated_at", 0.0) or 0.0)),
+        }
+
+    def _serialize_asr_reference_row(
+        self,
+        session_root: Path,
+        item: dict[str, object] | None,
+    ) -> dict[str, object] | None:
+        if not item:
+            return None
+        row = dict(item)
+        start_wall_ts = float(row.get("wall_ts_start", 0.0) or 0.0)
+        end_wall_ts = float(row.get("wall_ts_end", 0.0) or 0.0)
+        start_text = wall_ts_to_hhmmss(session_root, start_wall_ts)
+        end_text = wall_ts_to_hhmmss(session_root, end_wall_ts)
+        return {
+            "time_range": f"{start_text}-{end_text}",
+            "start_time": start_text,
+            "end_time": end_text,
+            "wall_ts_start": start_wall_ts,
+            "wall_ts_end": end_wall_ts,
+            "text": str(row.get("text", "") or "").strip(),
+            "conf": float(row.get("conf", 0.0) or 0.0),
+            "source": str(row.get("source", "") or "").strip(),
+            "matched_keywords": [str(x or "").strip() for x in list(row.get("matched_keywords") or []) if str(x or "").strip()],
+        }
+
+    async def _wait_for_publish_job(self, job_id: str, *, timeout_seconds: int) -> PublishJob | None:
+        if self._publish_runtime is None:
+            return None
+        target_id = str(job_id or "").strip()
+        if not target_id:
+            return None
+        timeout = max(0, int(timeout_seconds or 0))
+        current = self._publish_runtime.get_job(target_id)
+        if current is None or timeout <= 0:
+            return current
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if current.state in {"succeeded", "failed", "cancelled"}:
+                return current
+            await asyncio.sleep(0.5)
+            current = self._publish_runtime.get_job(target_id)
+            if current is None:
+                return None
+        return current
+
+    def _dump_recent_clips_tool_result(
+        self,
+        *,
+        available: bool,
+        reason: str,
+        clips: list[dict[str, object]],
+    ) -> str:
+        payload = {
+            "tool_enabled": True,
+            "available": bool(available),
+            "reason": str(reason or ""),
+            "clips": [self._serialize_clip_row(item) for item in clips],
+        }
+        return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+    def _dump_clip_review_candidates_tool_result(
+        self,
+        *,
+        available: bool,
+        reason: str,
+        candidates: list[dict[str, object]],
+        limit: int,
+        total: int,
+        refreshed: bool,
+        session_root: str,
+    ) -> str:
+        payload = {
+            "tool_enabled": True,
+            "available": bool(available),
+            "reason": str(reason or ""),
+            "limit": max(1, int(limit or 1)),
+            "total": max(0, int(total or 0)),
+            "refreshed": bool(refreshed),
+            "session_root": str(session_root or "").strip(),
+            "candidates": [self._serialize_candidate_row(item) for item in candidates],
+        }
+        return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+    def _dump_asr_lookup_tool_result(
+        self,
+        *,
+        available: bool,
+        reason: str,
+        rows: list[dict[str, object]],
+        total: int,
+        session_root: str,
+        start_time: str,
+        end_time: str,
+        keywords: list[str],
+        keyword_query: str,
+        limit: int,
+        error: str = "",
+    ) -> str:
+        session_path = Path(session_root).expanduser().resolve() if str(session_root or "").strip() else None
+        serialized_rows = []
+        if session_path is not None:
+            serialized_rows = [
+                self._serialize_asr_reference_row(session_path, item)
+                for item in rows
+            ]
+            serialized_rows = [item for item in serialized_rows if item is not None]
+        payload = {
+            "tool_enabled": True,
+            "available": bool(available),
+            "reason": str(reason or ""),
+            "error": str(error or "").strip(),
+            "session_root": str(session_root or "").strip(),
+            "start_time": str(start_time or "").strip(),
+            "end_time": str(end_time or "").strip(),
+            "keywords": [str(item or "").strip() for item in list(keywords or []) if str(item or "").strip()],
+            "keyword_query": str(keyword_query or "").strip(),
+            "limit": max(1, int(limit or 1)),
+            "total": max(0, int(total or 0)),
+            "rows": serialized_rows,
+        }
+        return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+    def _dump_publish_tool_result(
+        self,
+        *,
+        accepted: bool,
+        reason: str,
+        requested_clip_id: str,
+        resolved_clip: dict[str, object] | None,
+        job: PublishJob | None,
+        upload_now: bool,
+        used_latest_clip: bool,
+        draft_created: bool,
+        approved: bool,
+    ) -> str:
+        payload = {
+            "tool_enabled": True,
+            "accepted": bool(accepted),
+            "reason": str(reason or ""),
+            "requested_clip_id": str(requested_clip_id or "").strip(),
+            "resolved_clip": self._serialize_clip_row(resolved_clip),
+            "job": self._serialize_publish_job(job),
+            "upload_now": bool(upload_now),
+            "used_latest_clip": bool(used_latest_clip),
+            "draft_created": bool(draft_created),
+            "approved": bool(approved),
+        }
+        return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+    def _dump_publish_job_status_tool_result(
+        self,
+        *,
+        found: bool,
+        reason: str,
+        job: PublishJob | None,
+    ) -> str:
+        payload = {
+            "tool_enabled": True,
+            "found": bool(found),
+            "reason": str(reason or ""),
+            "job": self._serialize_publish_job(job),
+        }
+        return json.dumps(payload, ensure_ascii=False, sort_keys=True)
 
     def _publish_enabled_flag(self) -> bool:
         return self._load_config().publish_enabled
@@ -2819,6 +3506,42 @@ class BilibiliLiveWatcherPlugin(Star):
         return ("<bili_live_room_state>\n当有人问你是否在看直播，使用下述信息回答\n" + \
         f"正在观看直播\n主播名:{room_state['anchor_name']}\n状态:{room_state['live_status']}\n直播间名:{room_state['room_title']}\n" + \
         "</bili_live_room_state>\n")
+
+    def _build_publish_tool_guidance_text(self, cfg: WatchConfig) -> str:
+        if not cfg.publish_enabled:
+            return ""
+        return (
+            "<bili_publish_tools>\n"
+            "如果用户明确要求你上传/投稿/发布直播切片视频，或明确授权你代为发布视频，可以使用以下工具：\n"
+            "1. bili_recent_exported_clips：查看最近可投稿的 clip；如果用户没给 clip_id，可先选最近导出的 clip。\n"
+            "2. bili_publish_clip：创建草稿并可直接入队上传；标题、简介、标签可以由你自行生成。\n"
+            "3. bili_publish_job_status：查询投稿作业状态、失败原因和最终 bvid。\n"
+            "不要在用户未明确授权发布视频时调用这些工具。\n"
+            "</bili_publish_tools>\n"
+        )
+
+    def _build_review_tool_guidance_text(self, cfg: WatchConfig) -> str:
+        tool_lines: list[str] = []
+        if cfg.recording_enabled and cfg.recording_mode != "record_only":
+            tool_lines.extend(
+                [
+                    "1. bili_asr_range_reference：按 HH:MM:SS 时间范围读取本场直播该时间段的 ASR 文本。",
+                    "2. bili_asr_keyword_search：按关键词检索本场直播 ASR；可用 `关键词1|关键词2` 做 OR 查询。",
+                ]
+            )
+        if cfg.recording_enabled and cfg.recording_mode == "record_index_and_ai_clips" and cfg.clip_ai_enabled:
+            tool_lines.append(
+                "3. bili_clip_review_candidates：查看本场直播当前 session 的 AI 候选片段；需要尽量刷新最新候选时可传 refresh=true。"
+            )
+        if not tool_lines:
+            return ""
+        return (
+            "<bili_review_tools>\n"
+            "如果用户要求你查看本场直播候选片段、核对某个时间段主播说了什么，或按关键词定位本场直播里的 ASR 内容，可以使用以下工具：\n"
+            + "\n".join(tool_lines)
+            + "\n如果问题与当前直播回放、候选片段或 ASR 检索无关，不要调用这些工具。\n"
+            "</bili_review_tools>\n"
+        )
 
     def _inject_live_room_contexts(
         self,
@@ -3971,6 +4694,50 @@ class BilibiliLiveWatcherPlugin(Star):
                 return value
         return default
 
+    def _config_get_with_fallback_paths(
+        self,
+        path: str,
+        default: object = None,
+        *,
+        fallback_paths: tuple[str, ...] = (),
+        legacy_keys: tuple[str, ...] = (),
+    ) -> object:
+        missing = object()
+        value = self._config_get(path, missing)
+        if value is not missing:
+            return value
+        for fallback_path in fallback_paths:
+            value = self._config_get(fallback_path, missing)
+            if value is not missing:
+                return value
+        for legacy_key in legacy_keys:
+            value = self._config_get_direct(self.config, legacy_key, missing)
+            if value is not missing:
+                return value
+        return default
+
+    def _migrate_config_schema_paths_if_needed(self) -> bool:
+        migrated = False
+        mappings = (
+            ("danmu_loop.auto_reply_enabled", "global.auto_reply_enabled"),
+            ("danmu_loop.reply_interval_seconds", "main_loop.reply_interval_seconds"),
+            ("global.context_window_seconds", "main_loop.context_window_seconds"),
+            ("danmu_loop.danmaku_trigger_threshold", "main_loop.danmaku_trigger_threshold"),
+            ("danmu_loop.asr_trigger_threshold", "main_loop.asr_trigger_threshold"),
+        )
+        missing = object()
+        for canonical_path, obsolete_path in mappings:
+            canonical_value = self._config_get(canonical_path, missing)
+            if canonical_value is not missing:
+                continue
+            obsolete_value = self._config_get(obsolete_path, missing)
+            if obsolete_value is missing:
+                continue
+            self._set_config_value(canonical_path, obsolete_value)
+            self._config_delete_path(obsolete_path)
+            migrated = True
+        return migrated
+
     def _config_delete_path(self, path: str):
         parts = [part.strip() for part in str(path or "").split(".") if part.strip()]
         if not parts:
@@ -4006,36 +4773,53 @@ class BilibiliLiveWatcherPlugin(Star):
 
     def _load_config(self) -> WatchConfig:
         reply_interval_seconds = self._to_int(
-            self._config_get("main_loop.reply_interval_seconds", 15, legacy_keys=("reply_interval_seconds",)),
-            15,
+            self._config_get_with_fallback_paths(
+                "danmu_loop.reply_interval_seconds",
+                30,
+                fallback_paths=("main_loop.reply_interval_seconds",),
+                legacy_keys=("reply_interval_seconds",),
+            ),
+            30,
             1,
         )
         danmaku_trigger_threshold = self._to_int(
-            self._config_get("main_loop.danmaku_trigger_threshold", 20, legacy_keys=("danmaku_trigger_threshold",)),
-            20,
+            self._config_get_with_fallback_paths(
+                "danmu_loop.danmaku_trigger_threshold",
+                10,
+                fallback_paths=("main_loop.danmaku_trigger_threshold",),
+                legacy_keys=("danmaku_trigger_threshold",),
+            ),
+            10,
             0,
         )
         asr_trigger_threshold = self._to_int(
-            self._config_get("main_loop.asr_trigger_threshold", 1, legacy_keys=("asr_trigger_threshold",)),
-            1,
+            self._config_get_with_fallback_paths(
+                "danmu_loop.asr_trigger_threshold",
+                10,
+                fallback_paths=("main_loop.asr_trigger_threshold",),
+                legacy_keys=("asr_trigger_threshold",),
+            ),
+            10,
             0,
         )
         default_context_window_seconds = max(
+            300,
             reply_interval_seconds,
             reply_interval_seconds * DEFAULT_CONTEXT_WINDOW_MULTIPLIER,
         )
         context_window_seconds = self._to_int(
-            self._config_get(
-                "main_loop.context_window_seconds",
+            self._config_get_with_fallback_paths(
+                "global.context_window_seconds",
                 default_context_window_seconds,
+                fallback_paths=("main_loop.context_window_seconds",),
                 legacy_keys=("context_window_seconds",),
             ),
             default_context_window_seconds,
             1,
         )
         recording_segment_duration_seconds = self._to_int(
-            self._config_get("recording.segment_duration_seconds", 300),
-            300,
+            self._config_get("recording.segment_duration_seconds", 600),
+            600,
             30,
         )
         recording_max_session_hours = self._to_int(
@@ -4078,7 +4862,12 @@ class BilibiliLiveWatcherPlugin(Star):
             debug=self._to_bool(self._config_get("global.debug", False, legacy_keys=("debug",)), False),
             room_id=self._to_int(self._config_get("global.room_id", 0, legacy_keys=("room_id",)), 0, 0),
             auto_reply_enabled=self._to_bool(
-                self._config_get("global.auto_reply_enabled", False, legacy_keys=("auto_reply_enabled",)),
+                self._config_get_with_fallback_paths(
+                    "danmu_loop.auto_reply_enabled",
+                    False,
+                    fallback_paths=("global.auto_reply_enabled",),
+                    legacy_keys=("auto_reply_enabled",),
+                ),
                 False,
             ),
             reply_interval_seconds=reply_interval_seconds,
@@ -4111,8 +4900,8 @@ class BilibiliLiveWatcherPlugin(Star):
                 or DEFAULT_FUSED_PROMPT_TEMPLATE
             ),
             max_reply_chars=self._to_int(
-                self._config_get("generation.max_reply_chars", 60, legacy_keys=("max_reply_chars",)),
-                60,
+                self._config_get("generation.max_reply_chars", 30, legacy_keys=("max_reply_chars",)),
+                30,
                 10,
             ),
             bilibili_cookie=cookie,
@@ -4327,6 +5116,7 @@ class BilibiliLiveWatcherPlugin(Star):
         label: str,
         min_value: int,
         example: str,
+        obsolete_paths: tuple[str, ...] = (),
     ) -> str:
         raw = str(explicit_value or "").strip()
         if not raw:
@@ -4343,6 +5133,8 @@ class BilibiliLiveWatcherPlugin(Star):
             return f"{label} 无效，请输入{min_text}。例如：{example}"
 
         self._set_config_value(config_key, parsed)
+        for path in obsolete_paths:
+            self._config_delete_path(path)
         saved = self._save_config_if_possible()
         suffix = "（已保存）" if saved else "（运行时已生效，未持久化）"
         return f"已将 {label} 设置为 {parsed} {suffix}"

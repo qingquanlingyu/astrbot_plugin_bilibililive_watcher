@@ -200,6 +200,31 @@ def find_clip_by_id(storage_root: str | Path, clip_id: str) -> dict[str, object]
     return None
 
 
+def list_recent_clips(storage_root: str | Path, *, limit: int = 5) -> list[dict[str, object]]:
+    resolved_limit = max(1, int(limit or 0))
+    recordings_root = Path(storage_root).expanduser().resolve() / "recordings"
+    if not recordings_root.exists():
+        return []
+    rows: list[dict[str, object]] = []
+    for manifest_path in sorted(recordings_root.rglob("clip_manifest.jsonl")):
+        try:
+            session_root = manifest_path.parent.parent
+            for row in load_clip_manifest(session_root):
+                resolved = dict(row)
+                resolved["session_root"] = str(session_root)
+                rows.append(resolved)
+        except Exception:
+            continue
+    rows.sort(
+        key=lambda item: (
+            float(item.get("created_at", 0.0) or 0.0),
+            str(item.get("clip_id", "") or "").strip(),
+        ),
+        reverse=True,
+    )
+    return rows[:resolved_limit]
+
+
 def _format_date(raw_ts: float) -> str:
     if float(raw_ts or 0.0) <= 0:
         return ""
